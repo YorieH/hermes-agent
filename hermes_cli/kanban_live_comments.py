@@ -134,7 +134,10 @@ def current_acknowledged_cursor(task_id: str) -> int | None:
 
 
 def _turn_epoch(turn_id: str, api_request_id: str) -> str:
-    return str(turn_id or api_request_id or "").strip()
+    # One conversation turn can contain several model/tool iterations. Prefer
+    # the per-iteration request id so a comment delivered at api:N can be
+    # acknowledged at api:N+1, while parallel tools from api:N remain fenced.
+    return str(api_request_id or turn_id or "").strip()
 
 
 def acknowledge_delivered_comments(

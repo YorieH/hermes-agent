@@ -40,7 +40,16 @@ def _worker_env(monkeypatch, db_path, *, cursor="0"):
     return build_comment_delivery_state("owner-session")
 
 
-def _call(state, name, args, *, turn="turn-1", result=None, session="owner-session"):
+def _call(
+    state,
+    name,
+    args,
+    *,
+    turn="turn-1",
+    api_request="",
+    result=None,
+    session="owner-session",
+):
     dispatch = patch("model_tools.registry.dispatch", return_value=result or '{"ok":true}')
     with dispatch:
         return handle_function_call(
@@ -48,6 +57,7 @@ def _call(state, name, args, *, turn="turn-1", result=None, session="owner-sessi
             args,
             session_id=session,
             turn_id=turn,
+            api_request_id=api_request,
             kanban_comment_state=state,
         )
 
@@ -229,20 +239,77 @@ def test_owner_and_subagent_sessions_cannot_ack_each_other(monkeypatch, tmp_path
         conn.close()
 
 
-def test_same_turn_ack_cannot_consume_new_parallel_delivery(monkeypatch, tmp_path):
+def test_api_epoch_fences_parallel_ack_but_allows_next_iteration(
+    monkeypatch, tmp_path
+):
     path, conn = _comment_db(tmp_path)
     try:
         comment_id = _insert_comment(conn, "t_live", "sol", "same-turn update")
         state = _worker_env(monkeypatch, path)
 
         delivered = json.loads(_call(
-            state, "web_search", {"q": "x"}, turn="shared-turn"
+            state,
+            "web_search",
+            {"q": "x"},
+            turn="worker-turn",
+            api_request="worker-turn:api:0",
         ))
         assert "_kanban_coordinator_updates" in delivered
-        _call(state, "kanban_heartbeat", {}, turn="shared-turn")
+        _call(
+            state,
+            "kanban_heartbeat",
+            {},
+            turn="worker-turn",
+            api_request="worker-turn:api:0",
+        )
         assert state.acknowledged_cursor == 0
 
-        _call(state, "kanban_heartbeat", {}, turn="next-turn")
+        _call(
+            state,
+            "kanban_heartbeat",
+            {},
+            turn="worker-turn",
+            api_request="worker-turn:api:1",
+        )
+        assert state.acknowledged_cursor == comment_id
+    finally:
+        conn.close()
+
+
+def test_tool_call_bridge_preserves_api_delivery_epoch(monkeypatch, tmp_path):
+    path, conn = _comment_db(tmp_path)
+    try:
+        comment_id = _insert_comment(conn, "t_live", "sol", "bridge update")
+        state = _worker_env(monkeypatch, path)
+        tool_defs = [{
+            "type": "function",
+            "function": {"name": "deferred_probe", "parameters": {}},
+        }]
+
+        with (
+            patch("model_tools.get_tool_definitions", return_value=tool_defs),
+            patch(
+                "tools.tool_search.is_deferrable_tool_name",
+                side_effect=lambda name: name == "deferred_probe",
+            ),
+        ):
+            delivered = json.loads(_call(
+                state,
+                "tool_call",
+                {"name": "deferred_probe", "arguments": {}},
+                turn="worker-turn",
+                api_request="worker-turn:api:0",
+            ))
+
+        assert "_kanban_coordinator_updates" in delivered
+        assert state.delivery_epoch == "worker-turn:api:0"
+        _call(
+            state,
+            "kanban_heartbeat",
+            {},
+            turn="worker-turn",
+            api_request="worker-turn:api:1",
+        )
         assert state.acknowledged_cursor == comment_id
     finally:
         conn.close()
