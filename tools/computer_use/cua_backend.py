@@ -49,6 +49,26 @@ import threading
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+
+def _call_timeout_default() -> float:
+    """Per-call cua-driver timeout (seconds), env-overridable.
+
+    UIA tree walks (get_window_state, SOM captures) marshal property reads
+    into the target app's UI thread; an app that is busy or showing a modal
+    dialog can legitimately take >30s to answer. 30s proved too tight in
+    production (2026-07-05: Marvelous Designer with a modal Save dialog made
+    every SOM capture time out). Raise via HERMES_CUA_CALL_TIMEOUT.
+    """
+    raw = os.environ.get("HERMES_CUA_CALL_TIMEOUT")
+    try:
+        val = float(raw) if raw else 90.0
+    except ValueError:
+        return 90.0
+    return max(5.0, val)
+
+
+_CALL_TIMEOUT = _call_timeout_default()
+
 from tools.computer_use.backend import (
     ActionResult,
     CaptureResult,
@@ -933,10 +953,29 @@ class _CuaDriverSession:
                     default=-1,
                 )
                 if start != -1:
+                    candidate_text = out[start:]
                     try:
-                        candidate = json.loads(out[start:])
+                        candidate = json.loads(candidate_text)
                     except json.JSONDecodeError:
-                        candidate = None
+                        # Some cua-driver builds have emitted Windows paths in
+                        # JSON without escaping their backslashes. Repair only
+                        # the screenshot path field, then retry strict parsing.
+                        def _escape_screenshot_path(match: re.Match) -> str:
+                            return (
+                                match.group(1)
+                                + match.group(2).replace("\\", "\\\\")
+                                + match.group(3)
+                            )
+
+                        repaired = re.sub(
+                            r'("screenshot_file_path"\s*:\s*")(.*?)("\s*[,}])',
+                            _escape_screenshot_path,
+                            candidate_text,
+                        )
+                        try:
+                            candidate = json.loads(repaired)
+                        except json.JSONDecodeError:
+                            candidate = None
                     if candidate is not None:
                         parsed = candidate
                         break
@@ -986,7 +1025,7 @@ class _CuaDriverSession:
                 except OSError:
                     pass
 
-    def call_tool(self, name: str, args: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
+    def call_tool(self, name: str, args: Dict[str, Any], timeout: float = _CALL_TIMEOUT) -> Dict[str, Any]:
         self._require_started()
         # The cua-driver daemon proxy returns POSIX EAGAIN ("Resource
         # temporarily unavailable") for heavier calls like get_window_state when
@@ -2039,7 +2078,7 @@ class CuaDriverBackend(ComputerUseBackend):
     # ── Generic escape hatch ────────────────────────────────────────
 
     def call_tool(self, name: str, args: Optional[Dict[str, Any]] = None,
-                  *, timeout: float = 30.0) -> Dict[str, Any]:
+                  *, timeout: float = _CALL_TIMEOUT) -> Dict[str, Any]:
         """Call any cua-driver MCP tool by name with arbitrary args.
         ``session`` is injected (preserves the caller's explicit one
         via setdefault). For tools the wrapper doesn't already type-

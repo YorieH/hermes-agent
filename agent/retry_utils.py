@@ -137,6 +137,35 @@ def adaptive_rate_limit_backoff(
     return jittered_backoff(1, base_delay=base_delay, max_delay=base_delay, jitter_ratio=0.2), "zai_coding_overload_long"
 
 
+def structured_rate_limit_reset_wait(
+    error_context: Any,
+    *,
+    now: float | None = None,
+    max_delay: float = 600.0,
+    grace_seconds: float = 1.0,
+) -> float | None:
+    """Return a bounded wait from a provider's structured reset timestamp.
+
+    Some subscription-backed APIs put ``resets_at`` in the JSON error body but
+    omit ``Retry-After``. Retrying at 2/5 seconds turns a short, explicit quota
+    window into a failed kanban run. Honor only finite future timestamps inside
+    the same ten-minute ceiling used for Retry-After; longer or malformed
+    values fall back to the normal provider/fallback policy.
+    """
+    if not isinstance(error_context, dict):
+        return None
+    raw = error_context.get("reset_at")
+    try:
+        reset_at = float(raw)
+    except (TypeError, ValueError):
+        return None
+    current = time.time() if now is None else float(now)
+    delay = reset_at - current
+    if not (0 < delay <= max_delay):
+        return None
+    return min(max_delay, delay + max(0.0, float(grace_seconds)))
+
+
 def zai_coding_overload_retry_ceiling(short_attempts: int = _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS) -> int:
     """Retry-loop ceiling needed for the full Z.AI overload backoff schedule.
 

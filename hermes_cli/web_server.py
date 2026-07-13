@@ -1645,7 +1645,14 @@ def _default_hermes_root_is_opt_data() -> bool:
         root = get_default_hermes_root().expanduser().resolve(strict=False)
     except (OSError, RuntimeError):
         root = Path(raw).expanduser().resolve(strict=False)
-    return root == _HOSTED_MANAGED_FILES_ROOT
+    return root == _HOSTED_MANAGED_FILES_ROOT.resolve(strict=False)
+
+
+def _dashboard_home_path() -> Path:
+    raw_home = os.environ.get("HOME", "").strip()
+    if raw_home:
+        return _canonical_path(Path(raw_home))
+    return _canonical_path(Path.home())
 
 
 def _dashboard_local_update_managed_externally() -> bool:
@@ -1701,7 +1708,7 @@ def _managed_files_policy(request: Request, *, create_root: bool = True) -> Mana
         root = _ensure_managed_root(_HOSTED_MANAGED_FILES_ROOT) if create_root else _HOSTED_MANAGED_FILES_ROOT
         return ManagedFilesPolicy(default_path=root, locked_root=root, can_change_path=False)
 
-    home = _canonical_path(Path.home())
+    home = _dashboard_home_path()
     return ManagedFilesPolicy(default_path=home, locked_root=None, can_change_path=True)
 
 

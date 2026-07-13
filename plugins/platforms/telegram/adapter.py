@@ -26,7 +26,7 @@ def _redact_telegram_error_text(error: object) -> str:
     """Redact secrets from Telegram transport errors before logging or returning them."""
     text = "" if error is None else str(error)
     if not text:
-        return text
+        return "" if error is None else error.__class__.__name__
     try:
         from agent.redact import redact_sensitive_text
 
@@ -2052,6 +2052,13 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_network_error_count += 1
         self._send_path_degraded = True
         attempt = self._polling_network_error_count
+        status_error = _redact_telegram_error_text(error)
+        self._write_runtime_status_safe(
+            "telegram-network-retrying",
+            platform_state="retrying",
+            error_code="telegram_network_error",
+            error_message=status_error,
+        )
 
         if attempt > MAX_NETWORK_RETRIES:
             message = (
@@ -2372,6 +2379,12 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             await asyncio.wait_for(self._app.bot.get_me(), PROBE_TIMEOUT)
             self._send_path_degraded = False
+            self._write_runtime_status_safe(
+                "telegram-network-recovered",
+                platform_state="connected",
+                error_code=None,
+                error_message=None,
+            )
         except Exception as probe_err:
             logger.warning(
                 "[%s] Polling heartbeat probe failed %ds after reconnect: %s",
@@ -2463,6 +2476,13 @@ class TelegramAdapter(BasePlatformAdapter):
         # retry attempt instead of returning silently, and only escalate to
         # fatal after all retries are exhausted.
         self._polling_conflict_count += 1
+        status_error = _redact_telegram_error_text(error)
+        self._write_runtime_status_safe(
+            "telegram-conflict-retrying",
+            platform_state="retrying",
+            error_code="telegram_polling_conflict",
+            error_message=status_error,
+        )
 
         MAX_CONFLICT_RETRIES = 5
         # Delay grows with each attempt: 15s, 25s, 35s, 45s, 55s.
@@ -2533,6 +2553,12 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES,
                 )
                 self._polling_conflict_count = 0  # reset counter on success
+                self._write_runtime_status_safe(
+                    "telegram-conflict-recovered",
+                    platform_state="connected",
+                    error_code=None,
+                    error_message=None,
+                )
                 return
             except Exception as retry_err:
                 logger.warning(
@@ -3002,13 +3028,11 @@ class TelegramAdapter(BasePlatformAdapter):
         instead.  Webhook mode is useful for cloud deployments (Fly.io,
         Railway) where inbound HTTP can wake a suspended machine.
 
-        ``is_reconnect`` distinguishes a cold first boot (False — drop any
-        stale Bot API queue) from a watcher reconnect after a prolonged
-        outage (True — preserve the updates Telegram queued while the bot
-        was offline, otherwise every message sent during the outage is
-        silently lost). The in-process network-error ladder and the
-        409-conflict handler already pass ``drop_pending_updates=False``
-        for the same reason; bootstrap follows suit on the reconnect path.
+        Hermes preserves the Bot API queue across both cold boots and watcher
+        reconnects so messages sent while a local gateway was offline are not
+        silently lost. The ``is_reconnect`` flag is still accepted for the
+        platform reconnect contract, but Telegram polling and webhook startup
+        both use ``drop_pending_updates=False``.
 
         Env vars for webhook mode::
 
@@ -3146,6 +3170,27 @@ class TelegramAdapter(BasePlatformAdapter):
                 _transport_kwargs: dict = {}
                 if _pool_limits is not None:
                     _transport_kwargs["limits"] = _pool_limits
+                _local_address = None
+                if getattr(self.config, "extra", None):
+                    _local_address = self.config.extra.get("local_address")
+                if _local_address:
+                    try:
+                        import ipaddress as _ipaddress
+
+                        _transport_kwargs["local_address"] = str(
+                            _ipaddress.ip_address(str(_local_address).strip())
+                        )
+                        logger.info(
+                            "[%s] Binding Telegram transport to local address %s",
+                            self.name,
+                            _transport_kwargs["local_address"],
+                        )
+                    except ValueError:
+                        logger.warning(
+                            "[%s] Ignoring invalid Telegram local_address: %r",
+                            self.name,
+                            _local_address,
+                        )
                 request = HTTPXRequest(
                     **request_kwargs,
                     httpx_kwargs={
@@ -3303,11 +3348,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     webhook_url=webhook_url,
                     secret_token=webhook_secret,
                     allowed_updates=Update.ALL_TYPES,
-                    # Webhooks are push-based — Telegram does not hold a
-                    # server-side getUpdates queue, so this flag is a no-op
-                    # in practice. Mirror the polling path's reconnect
-                    # semantics for consistency.
-                    drop_pending_updates=not is_reconnect,
+                    # Preserve messages sent while the gateway was offline.
+                    drop_pending_updates=False,
                 )
                 self._webhook_mode = True
                 logger.info(
@@ -3352,10 +3394,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._polling_error_callback_ref = _polling_error_callback
 
                 polling_started = await self._start_polling_resilient(
-                    # On a cold first boot drop the stale Bot API queue; on a
-                    # watcher reconnect after an outage preserve it so messages
-                    # sent while the bot was offline are delivered (#46621).
-                    drop_pending_updates=not is_reconnect,
+                    # Preserve messages sent while the gateway was offline on
+                    # both cold boots and reconnects.
+                    drop_pending_updates=False,
                     error_callback=_polling_error_callback,
                 )
                 if not polling_started:

@@ -575,6 +575,30 @@ def _resolve_gateway_display_bool(
     return bool(value)
 
 
+def _should_send_turn_start_ack(user_config: dict, platform_key: str, message: str) -> bool:
+    """Return True when this user-facing turn should get an immediate receipt."""
+    if not str(message or "").strip():
+        return False
+    stripped = str(message or "").lstrip()
+    internal_prefixes = (
+        "[IMPORTANT:",
+        "[ASYNC ",
+        "[KANBAN ",
+        "[SYSTEM:",
+        "[RECOVERY ",
+    )
+    if stripped.upper().startswith(tuple(prefix.upper() for prefix in internal_prefixes)):
+        return False
+    if stripped.startswith("[Session was just handed off"):
+        return False
+    return _resolve_gateway_display_bool(
+        user_config,
+        platform_key,
+        "turn_start_ack",
+        default=False,
+    )
+
+
 def _telegramize_command_mentions(text: str, platform: Any) -> str:
     """Rewrite slash-command mentions to Telegram-valid command names.
 
@@ -11019,7 +11043,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Consume the is_fresh_reset flag immediately so it doesn't leak
         # onto subsequent messages in the same session (issue #6508).
         if getattr(session_entry, "is_fresh_reset", False):
-            session_entry.is_fresh_reset = False
+            try:
+                consumed = await self.async_session_store.consume_fresh_reset(session_key)
+            except Exception as _consume_exc:
+                consumed = False
+                logger.debug(
+                    "Failed to persist consumed fresh-reset flag for %s: %s",
+                    session_key,
+                    _consume_exc,
+                )
+            if not consumed:
+                session_entry.is_fresh_reset = False
         if _is_new_session:
             await self.hooks.emit("session:start", {
                 "platform": source.platform.value if source.platform else "",
@@ -11184,6 +11218,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # compression on every turn in long gateway sessions.
             _hyg_model = "anthropic/claude-sonnet-4.6"
             _hyg_threshold_pct = 0.85
+            _hyg_configured_threshold_pct = 0.50
+            _hyg_codex_gpt55_autoraise = True
             _hyg_compression_enabled = True
             _hyg_hard_msg_limit = 5000
             _hyg_config_context_length = None
@@ -11220,6 +11256,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _hyg_compression_enabled = str(
                             _comp_cfg.get("enabled", True)
                         ).lower() in {"true", "1", "yes"}
+                        try:
+                            _hyg_configured_threshold_pct = float(
+                                _comp_cfg.get("threshold", 0.50)
+                            )
+                        except (TypeError, ValueError):
+                            _hyg_configured_threshold_pct = 0.50
+                        _hyg_codex_gpt55_autoraise = str(
+                            _comp_cfg.get("codex_gpt55_autoraise", True)
+                        ).lower() in {"true", "1", "yes"}
                         _raw_hard_limit = _comp_cfg.get("hygiene_hard_message_limit")
                         if _raw_hard_limit is not None:
                             try:
@@ -11238,6 +11283,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _hyg_provider = _hyg_runtime.get("provider") or _hyg_provider
                     _hyg_base_url = _hyg_runtime.get("base_url") or _hyg_base_url
                     _hyg_api_key = _hyg_runtime.get("api_key") or _hyg_api_key
+                except Exception:
+                    pass
+
+                # Match the agent's explicit opt-out for the Codex GPT-5.5
+                # threshold autoraise. Default hygiene still uses the high
+                # safety threshold, but profiles that set
+                # compression.codex_gpt55_autoraise: false expect the configured
+                # compression.threshold to apply everywhere, including gateway
+                # autoresume/session-hygiene compression.
+                try:
+                    from agent.auxiliary_client import (
+                        _is_codex_gpt54_or_gpt55 as _hyg_is_codex_gpt54_or_gpt55,
+                    )
+
+                    if (
+                        not _hyg_codex_gpt55_autoraise
+                        and _hyg_is_codex_gpt54_or_gpt55(
+                            _hyg_model, _hyg_provider or ""
+                        )
+                    ):
+                        _hyg_threshold_pct = _hyg_configured_threshold_pct
                 except Exception:
                     pass
 
@@ -15528,11 +15594,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return None
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-        adapter = None
-        for p, a in self.adapters.items():
-            if p.value == platform_name:
-                adapter = a
-                break
+        adapter = self._adapter_for_source(source)
         if not adapter:
             return None
         try:
@@ -18112,6 +18174,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         else:
             _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
 
+        if _status_adapter and _should_send_turn_start_ack(user_config, platform_key, message):
+            try:
+                await _status_adapter.send(
+                    _status_chat_id,
+                    "Got it - starting now.",
+                    metadata=_non_conversational_metadata(
+                        _status_thread_metadata,
+                        platform=source.platform,
+                    ),
+                )
+            except Exception as _ack_err:
+                logger.debug("turn_start_ack send failed: %s", _ack_err)
+
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
                 return
@@ -18960,19 +19035,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 _persist_user_message_override = message
                 # The empty-message case is the auto-resume startup turn
-                # synthesized by _schedule_resume_pending_sessions — there is
-                # no NEW user message to address, so tell the model to report
-                # recovery instead of the (nonexistent) "new message".
-                if message:
-                    _resume_guidance = (
-                        "Address the user's NEW message below FIRST and focus "
-                        "on what the user is asking now."
-                    )
-                else:
-                    _resume_guidance = (
-                        "Report to the user that the session was restored "
-                        "successfully and ask what they would like to do next."
-                    )
+                # synthesized by _schedule_resume_pending_sessions. There is
+                # no new user request, and letting a model loose on a large,
+                # tool-heavy history can reopen stale work or hang the chat in
+                # a permanent "typing" state. Return a deterministic recovery
+                # notice through the normal result path so the finalizer clears
+                # resume_pending without spending a model/tool turn.
+                if not message:
+                    return {
+                        "final_response": (
+                            "Gateway restored the previous session. I paused "
+                            "before doing anything else; send the next "
+                            "instruction when you want me to continue."
+                        ),
+                        "messages": history,
+                        "api_calls": 0,
+                        "completed": True,
+                        "interrupted": False,
+                    }
+                _resume_guidance = (
+                    "Address the user's NEW message below FIRST and focus "
+                    "on what the user is asking now."
+                )
                 message = (
                     f"[System note: The previous turn was interrupted by "
                     f"{_reason_phrase}; the gateway is now back online. "
@@ -20441,6 +20525,20 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
     tick_count = 0
     while not stop_event.is_set():
         tick_count += 1
+
+        try:
+            from gateway.status import write_runtime_status
+            write_runtime_status(gateway_state="running")
+            atomic_json_write(
+                _hermes_home / "gateway_heartbeat.json",
+                {
+                    "pid": os.getpid(),
+                    "updated_at": datetime.utcnow().isoformat() + "+00:00",
+                },
+                indent=None,
+            )
+        except Exception as e:
+            logger.debug("Runtime heartbeat update error: %s", e)
 
         if tick_count % CHANNEL_DIR_EVERY == 0 and adapters:
             try:

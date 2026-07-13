@@ -772,6 +772,50 @@ def test_cli_archive_bulk(kanban_home):
         conn.close()
 
 
+def test_cli_archive_refuses_running_without_force(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="active", assignee="worker")
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+
+    out = run_slash(f"archive {tid}")
+    assert "active" in out.lower() or "force-running" in out.lower()
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+        assert task.current_run_id is not None
+    finally:
+        conn.close()
+
+
+def test_cli_archive_force_running_closes_run(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="active", assignee="worker")
+        kb.claim_task(conn, tid)
+        open_run = kb.latest_run(conn, tid)
+    finally:
+        conn.close()
+
+    out = run_slash(f"archive {tid} --force-running")
+    assert "Archived" in out
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task.status == "archived"
+        assert task.current_run_id is None
+        closed = kb.get_run(conn, open_run.id)
+        assert closed.ended_at is not None
+        assert closed.outcome == "reclaimed"
+    finally:
+        conn.close()
+
+
 def test_cli_archive_rm_deletes_archived_tasks(kanban_home):
     conn = kb.connect()
     try:
@@ -1958,6 +2002,19 @@ def test_archive_of_running_task_closes_run(kanban_home):
         closed = kb.get_run(conn, open_run_id)
         assert closed.ended_at is not None
         assert closed.outcome == "reclaimed"
+    finally:
+        conn.close()
+
+
+def test_archive_running_can_be_refused(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="x", assignee="worker")
+        kb.claim_task(conn, tid)
+        assert kb.archive_task(conn, tid, allow_running=False) is False
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+        assert task.current_run_id is not None
     finally:
         conn.close()
 
@@ -3809,7 +3866,7 @@ def test_gateway_dispatcher_retries_corrupt_board_after_quarantine(
     def _monotonic_for_gateway_dispatcher():
         caller = inspect.currentframe().f_back  # type: ignore[union-attr]
         code = caller.f_code if caller is not None else None
-        filename = code.co_filename if code is not None else ""
+        filename = (code.co_filename if code is not None else "").replace("\\", "/")
         # The kanban dispatcher/notifier watcher loops were extracted from
         # gateway/run.py into gateway/kanban_watchers.py (god-file Phase 3),
         # so accept either filename for the time-travel mock.
@@ -4409,7 +4466,7 @@ def test_detect_crashed_workers_protocol_violation_auto_blocks(kanban_home):
     against small local models (gemma4-e2b q4) where the model writes
     the answer as plain text and the CLI exits rc=0 cleanly.
     """
-    import hermes_cli.kanban_db as _kb
+    _kb = kb
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="quiet", assignee="worker")
@@ -4432,16 +4489,17 @@ def test_detect_crashed_workers_protocol_violation_auto_blocks(kanban_home):
 
         assert tid in result_crashed, "should be detected as crashed"
         task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        kinds = [e.kind for e in events]
         assert task.status == "blocked", (
             f"protocol violation should auto-block on first occurrence, "
-            f"got status={task.status}"
+            f"got status={task.status}, failures={task.consecutive_failures}, "
+            f"events={kinds}, last_failure={task.last_failure_error!r}"
         )
         assert "kanban_complete" in (task.last_failure_error or ""), (
             f"expected protocol-violation message, got {task.last_failure_error!r}"
         )
 
-        events = kb.list_events(conn, tid)
-        kinds = [e.kind for e in events]
         assert "protocol_violation" in kinds, (
             f"expected 'protocol_violation' event, got {kinds}"
         )
@@ -4461,7 +4519,7 @@ def test_detect_crashed_workers_nonzero_exit_uses_default_limit(kanban_home):
     """A worker that exited non-zero (real error / crash) uses the
     normal counter path — one failure doesn't trip the breaker.
     """
-    import hermes_cli.kanban_db as _kb
+    _kb = kb
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="crashy", assignee="worker")

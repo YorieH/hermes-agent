@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json as jsonlib
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -59,7 +60,6 @@ def _patch_list_profiles(names: list[str]):
     """Pretend the named profiles exist. The decomposer uses
     profiles_mod.list_profiles() to build the roster + valid-set, and
     profiles_mod.profile_exists() to resolve orchestrator/default."""
-    from types import SimpleNamespace
     fake_profiles = [
         SimpleNamespace(
             name=n, is_default=(i == 0), description=f"desc for {n}",
@@ -72,6 +72,26 @@ def _patch_list_profiles(names: list[str]):
         patch("hermes_cli.profiles.profile_exists", side_effect=lambda x: x in names),
         patch("hermes_cli.profiles.get_active_profile_name", return_value=names[0] if names else "default"),
     ]
+
+
+def test_orchestrator_prefers_explicit_task_assignee():
+    cfg = {"kanban": {"orchestrator_profile": "kairi"}}
+    task = SimpleNamespace(assignee="asuna", created_by="kurumi")
+    with patch(
+        "hermes_cli.profiles.profile_exists",
+        side_effect=lambda name: name in {"asuna", "kurumi", "kairi"},
+    ):
+        assert decomp._resolve_orchestrator_profile(cfg, task=task) == "asuna"
+
+
+def test_orchestrator_uses_valid_creator_before_configured_fallback():
+    cfg = {"kanban": {"orchestrator_profile": "kairi"}}
+    task = SimpleNamespace(assignee="missing", created_by="kurumi")
+    with patch(
+        "hermes_cli.profiles.profile_exists",
+        side_effect=lambda name: name in {"kurumi", "kairi"},
+    ):
+        assert decomp._resolve_orchestrator_profile(cfg, task=task) == "kurumi"
 
 
 def test_decompose_with_fanout_creates_children(kanban_home):

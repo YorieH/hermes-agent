@@ -2135,6 +2135,25 @@ class SessionStore:
             self._save()
             return True
 
+    def consume_fresh_reset(self, session_key: str) -> bool:
+        """Clear ``is_fresh_reset`` once the first post-/new turn starts.
+
+        ``reset_session()`` sets ``is_fresh_reset=True`` so the next inbound
+        message can still be treated as a new session even after
+        ``get_or_create_session()`` bumps ``updated_at``.  Once that message is
+        actually being handled, persist the consumed flag immediately.  Without
+        this, an unclean gateway restart during that first turn can mistake the
+        session for an unused fresh reset and skip legitimate recovery.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or not entry.is_fresh_reset:
+                return False
+            entry.is_fresh_reset = False
+            self._save()
+            return True
+
     def prune_old_entries(self, max_age_days: int) -> int:
         """Drop SessionEntry records older than max_age_days.
 
@@ -2218,6 +2237,12 @@ class SessionStore:
             self._ensure_loaded_locked()
             for entry in self._entries.values():
                 if entry.resume_pending:
+                    continue
+                # A freshly-created /new session has a very recent updated_at
+                # but no work to recover yet.  Treating that as crash-resumable
+                # resurrects the conversation the user explicitly discarded if
+                # the gateway is restarted right after /new.
+                if entry.is_fresh_reset:
                     continue
                 if not entry.suspended and entry.updated_at >= cutoff:
                     entry.resume_pending = True

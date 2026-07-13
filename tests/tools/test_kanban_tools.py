@@ -117,6 +117,40 @@ def test_worker_with_kanban_toolset_still_hides_board_routing(monkeypatch, tmp_p
     )
 
 
+def test_coordinator_review_worker_gets_board_routing_tools(monkeypatch, tmp_path):
+    """Coordinator-review workers can route the original blocked task."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "kairi")
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        original = kb.create_task(conn, title="original", assignee="asuna")
+        review = kb.create_task(
+            conn,
+            title="Coordinator review/unblock: original",
+            assignee="kairi",
+            idempotency_key=f"coordinator-review:{original}:1",
+        )
+        kb.claim_task(conn, review)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", review)
+
+    import tools.kanban_tools  # ensure registered
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
+    names = {s["function"].get("name") for s in schema if "function" in s}
+    assert "kanban_list" in names
+    assert "kanban_unblock" in names
+
+
 def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     """Orchestrator profiles with toolsets: [kanban] see all kanban tools."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
@@ -328,7 +362,10 @@ def test_complete_metadata_round_trips_through_show(worker_env):
         "summary": "finished with structured evidence",
         "metadata": handoff,
     })
-    assert json.loads(complete_out)["ok"] is True
+    complete_result = json.loads(complete_out)
+    assert complete_result["ok"] is True
+    assert complete_result["terminal"] is True
+    assert "Stop now" in complete_result["instruction"]
 
     show_out = kt._handle_show({"task_id": worker_env})
     shown = json.loads(show_out)
@@ -723,6 +760,8 @@ def test_block_happy_path(worker_env):
     out = kt._handle_block({"reason": "need clarification"})
     d = json.loads(out)
     assert d["ok"] is True
+    assert d["terminal"] is True
+    assert "Stop now" in d["instruction"]
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
@@ -817,6 +856,12 @@ def test_block_goal_mode_allows_dependency_kind(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
 
     tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="unfinished dependency")
+        kb.link_tasks(conn, parent_id=parent, child_id=tid)
+    finally:
+        conn.close()
     out = kt._handle_block({"reason": "waiting on another task", "kind": "dependency"})
     d = json.loads(out)
     assert d.get("ok") is True
@@ -1633,6 +1678,43 @@ def test_worker_unblock_rejects_foreign_task_id(worker_env):
         conn.close()
 
 
+def test_coordinator_review_worker_can_unblock_only_original(monkeypatch, tmp_path):
+    """Coordinator-review task workers may unblock their linked original only."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "kairi")
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
+
+    from hermes_cli import kanban_db as kb
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kb.connect() as conn:
+        original = kb.create_task(conn, title="blocked original", assignee="asuna")
+        other = kb.create_task(conn, title="blocked sibling", assignee="kurumi")
+        kb.block_task(conn, original, reason="review-required: needs coordinator")
+        kb.block_task(conn, other, reason="waiting")
+        review = kb.create_task(
+            conn,
+            title="Coordinator review/unblock: blocked original",
+            assignee="kairi",
+            idempotency_key=f"coordinator-review:{original}:1",
+        )
+        kb.claim_task(conn, review)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", review)
+
+    from tools import kanban_tools as kt
+    good = json.loads(kt._handle_unblock({"task_id": original}))
+    assert good.get("ok") is True, good
+    bad = json.loads(kt._handle_unblock({"task_id": other}))
+    assert "refusing to mutate" in bad.get("error", "")
+
+    with kb.connect() as conn:
+        assert kb.get_task(conn, original).status == "ready"
+        assert kb.get_task(conn, other).status == "blocked"
+
+
 def test_worker_complete_own_task_still_works(worker_env):
     """The ownership check doesn't break the normal own-task happy path."""
     from tools import kanban_tools as kt
@@ -2125,6 +2207,31 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     assert s["chat_id"] == "chat-42"
     assert s["thread_id"] == "thread-7"
     assert s["user_id"] == "user-9"
+
+
+def test_create_subscribes_gateway_session_and_internal_wake(monkeypatch, worker_env):
+    """Chat-originated orchestration gets both visible notification and agent wake."""
+    from tools import kanban_tools as kt
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
+    monkeypatch.setenv("HERMES_SESSION_KEY", "agent:main:telegram:dm:chat-42")
+
+    out = kt._handle_create({
+        "title": "auto-sub gateway and wake",
+        "assignee": "peer",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["subscribed"] is True, d
+
+    subs = _sub_index(_list_subs_for_task(d["task_id"]))
+    assert {
+        (s["platform"], s["chat_id"])
+        for s in subs
+    } == {
+        ("telegram", "chat-42"),
+        ("tui", "agent:main:telegram:dm:chat-42"),
+    }
 
 
 def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):

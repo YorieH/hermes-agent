@@ -304,6 +304,7 @@ class TestPlatformDefaults:
         # Periodic "Working — N min" heartbeat — keep on. Otherwise long
         # turns appear completely silent.
         assert resolve_display_setting({}, "telegram", "long_running_notifications") is True
+        assert resolve_display_setting({}, "telegram", "turn_start_ack") is False
         # Verbose iteration counter in busy-ack and heartbeat — off by
         # default on Telegram (mobile chat is cramped enough without
         # "iteration 21/60" debug detail).
@@ -324,6 +325,7 @@ class TestPlatformDefaults:
                     "telegram": {
                         "interim_assistant_messages": False,
                         "long_running_notifications": False,
+                        "turn_start_ack": "on",
                         "busy_ack_detail": "on",
                     }
                 }
@@ -331,6 +333,7 @@ class TestPlatformDefaults:
         }
         assert resolve_display_setting(config, "telegram", "interim_assistant_messages") is False
         assert resolve_display_setting(config, "telegram", "long_running_notifications") is False
+        assert resolve_display_setting(config, "telegram", "turn_start_ack") is True
         assert resolve_display_setting(config, "telegram", "busy_ack_detail") is True
 
 

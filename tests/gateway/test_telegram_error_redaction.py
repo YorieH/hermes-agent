@@ -23,7 +23,7 @@ import pytest
 
 from gateway.config import PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
-from plugins.platforms.telegram.adapter import TelegramAdapter
+from plugins.platforms.telegram.adapter import TelegramAdapter, _redact_telegram_error_text
 
 _SECRET_TOKEN = "123456789:AAFakeSecretTelegramBotTokenABCDEFGHIJ"
 _SECRET_URL = f"https://api.telegram.org/bot{_SECRET_TOKEN}/getMe"
@@ -41,6 +41,15 @@ def _make_connected_adapter() -> TelegramAdapter:
     bot.send_chat_action = AsyncMock()
     adapter._bot = bot
     return adapter
+
+
+def test_empty_transport_error_uses_exception_class_name():
+    """Timeout classes often stringify to empty; logs must stay actionable."""
+
+    class TimedOut(Exception):
+        pass
+
+    assert _redact_telegram_error_text(TimedOut()) == "TimedOut"
 
 
 @pytest.mark.asyncio

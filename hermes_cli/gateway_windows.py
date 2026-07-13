@@ -389,8 +389,9 @@ def _build_gateway_cmd_script(
     The script:
       - cd's into a stable working directory
       - exports HERMES_HOME, PYTHONIOENCODING, VIRTUAL_ENV
-      - invokes ``pythonw -m hermes_cli.main [--profile X] gateway run``
-        directly so the wrapper cmd.exe exits without a visible gateway console
+      - starts ``pythonw -m hermes_cli.main [--profile X] gateway run``
+        asynchronously so the wrapper cmd.exe exits instead of lingering for
+        the gateway lifetime
 
     We intentionally do NOT inline PATH overrides here — cmd.exe inherits
     the per-user PATH the Scheduled Task was created with, and forcibly
@@ -415,13 +416,12 @@ def _build_gateway_cmd_script(
     if profile_arg:
         prog_args.extend(profile_arg.split())
     prog_args.extend(["gateway", "run"])
-    # `pythonw.exe` is a GUI-subsystem executable: cmd.exe launches it and
-    # returns immediately, so the Scheduled Task action finishes without a
-    # visible console window. Do NOT use `start` here; that creates an extra
-    # wrapper process and made gateway lifecycle/status harder to reason about.
+    # Batch files wait for GUI-subsystem executables when invoked through the
+    # Startup/watchdog cmd.exe path. Use START so the wrapper exits immediately
+    # instead of leaving a minimized cmd.exe around for the gateway lifetime.
     # Do NOT use `--replace` for service-managed starts; repeated /Run calls
     # should be idempotent, not churn parent/child takeover loops.
-    lines.append(" ".join(_quote_cmd_script_arg(a) for a in prog_args))
+    lines.append('start "" /b ' + " ".join(_quote_cmd_script_arg(a) for a in prog_args))
     lines.append("exit /b 0")
     return "\r\n".join(lines) + "\r\n"
 
@@ -1649,6 +1649,33 @@ def _wait_for_gateway_absent(timeout_s: float = 30.0, interval_s: float = 0.5) -
     return get_running_pid() is None and not _gateway_pids()
 
 
+def get_gateway_maintenance_marker_path() -> Path:
+    """Marker used by external watchdogs to pause crash recovery during restart."""
+    from hermes_cli.config import get_hermes_home
+
+    return Path(get_hermes_home()) / "gateway_maintenance.lock"
+
+
+def _write_gateway_maintenance_marker(reason: str) -> Path | None:
+    """Best-effort marker so watchdogs do not race an intentional restart."""
+    try:
+        path = get_gateway_maintenance_marker_path()
+        path.write_text(f"{time.time():.3f} {reason}\n", encoding="utf-8")
+        return path
+    except Exception:
+        return None
+
+
+def _clear_gateway_maintenance_marker(path: Path | None = None) -> None:
+    try:
+        marker = path or get_gateway_maintenance_marker_path()
+        marker.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
 def restart() -> None:
     """Stop the gateway then start it again.
 
@@ -1660,23 +1687,27 @@ def restart() -> None:
     """
     _assert_windows()
 
-    stop()
+    marker = _write_gateway_maintenance_marker("gateway restart")
+    try:
+        stop()
 
-    if not _wait_for_gateway_absent(timeout_s=30.0):
-        print("⚠ Gateway still present after stop; forcing termination before restart...")
-        _force_terminate_known_gateway_pids(_collect_gateway_stop_pids())
-        if not _wait_for_gateway_absent(timeout_s=10.0):
+        if not _wait_for_gateway_absent(timeout_s=30.0):
+            print("⚠ Gateway still present after stop; forcing termination before restart...")
+            _force_terminate_known_gateway_pids(_collect_gateway_stop_pids())
+            if not _wait_for_gateway_absent(timeout_s=10.0):
+                raise RuntimeError(
+                    "Gateway process still detected after force kill; refusing to "
+                    "start a duplicate. Investigate stray PIDs before retrying."
+                )
+
+        # Give Windows a moment to release the listening port.
+        time.sleep(1.0)
+        start()
+
+        if not _wait_for_gateway_ready(timeout_s=15.0):
             raise RuntimeError(
-                "Gateway process still detected after force kill; refusing to "
-                "start a duplicate. Investigate stray PIDs before retrying."
+                "Gateway restart did not produce a running gateway process. "
+                "Check logs/gateway.log and run `hermes gateway status`."
             )
-
-    # Give Windows a moment to release the listening port.
-    time.sleep(1.0)
-    start()
-
-    if not _wait_for_gateway_ready(timeout_s=15.0):
-        raise RuntimeError(
-            "Gateway restart did not produce a running gateway process. "
-            "Check logs/gateway.log and run `hermes gateway status`."
-        )
+    finally:
+        _clear_gateway_maintenance_marker(marker)

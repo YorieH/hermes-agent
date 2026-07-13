@@ -319,6 +319,7 @@ from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
 from hermes_cli.subcommands.mcp import build_mcp_parser
 from hermes_cli.subcommands.claw import build_claw_parser
+from hermes_cli.subcommands.evals import build_eval_parser
 
 
 def _require_tty(command_name: str) -> None:
@@ -13069,6 +13070,11 @@ def main():
     # status command  (parser built in hermes_cli/subcommands/status.py)
     # =========================================================================
     build_status_parser(subparsers, cmd_status=cmd_status)
+
+    # =========================================================================
+    # eval command  (parser built in hermes_cli/subcommands/evals.py)
+    # =========================================================================
+    build_eval_parser(subparsers)
 
     # =========================================================================
     # cron command  (parser built in hermes_cli/subcommands/cron.py)

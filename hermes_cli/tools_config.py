@@ -1652,6 +1652,29 @@ def _get_platform_tools(
     """Resolve which individual toolset names are enabled for a platform."""
     from toolsets import resolve_toolset, TOOLSETS
 
+    def _resolve_config_membership_tools(ts_name: str, visited: Optional[Set[str]] = None) -> Set[str]:
+        """Resolve tools for config membership using static TOOLSETS entries.
+
+        ``toolsets.resolve_toolset()`` intentionally merges tools registered
+        dynamically at runtime. That is correct when building the final model
+        schema, but platform config inference needs stable static membership:
+        a check_fn-gated runtime tool added to an existing toolset must not
+        make the platform resolver think the whole toolset is absent.
+        """
+        ts_name = str(ts_name)
+        ts_def = TOOLSETS.get(ts_name)
+        if not ts_def:
+            return set(resolve_toolset(ts_name))
+        if visited is None:
+            visited = set()
+        if ts_name in visited:
+            return set()
+        visited.add(ts_name)
+        tools = set(ts_def.get("tools", []))
+        for included_name in ts_def.get("includes", []):
+            tools.update(_resolve_config_membership_tools(included_name, visited))
+        return tools
+
     platform_toolsets = config.get("platform_toolsets") or {}
     toolset_names = platform_toolsets.get(platform)
     # Track whether the user explicitly saved a toolset list for this platform
@@ -1702,7 +1725,7 @@ def _get_platform_tools(
                 continue
             if ts_name not in TOOLSETS:
                 continue
-            composite_tools.update(resolve_toolset(ts_name))
+            composite_tools.update(_resolve_config_membership_tools(ts_name))
 
         if composite_tools:
             expanded = set()
@@ -1733,7 +1756,7 @@ def _get_platform_tools(
         # (e.g. "hermes-cli") to individual tool names and reverse-mapping.
         all_tool_names = set()
         for ts_name in toolset_names:
-            all_tool_names.update(resolve_toolset(ts_name))
+            all_tool_names.update(_resolve_config_membership_tools(ts_name))
 
         enabled_toolsets = set()
         for ts_key, _, _ in CONFIGURABLE_TOOLSETS:
@@ -1800,13 +1823,13 @@ def _get_platform_tools(
     # to True) silently drops them.
     _plat_info = PLATFORMS.get(platform)
     _default_ts = _plat_info["default_toolset"] if _plat_info else f"hermes-{platform}"
-    platform_tool_universe = set(resolve_toolset(_default_ts))
+    platform_tool_universe = _resolve_config_membership_tools(_default_ts)
     configurable_tool_universe = set()
     for ck in configurable_keys:
-        configurable_tool_universe.update(resolve_toolset(ck))
+        configurable_tool_universe.update(_resolve_config_membership_tools(ck))
     claimed = set()
     for ts_key in enabled_toolsets:
-        claimed.update(resolve_toolset(ts_key))
+        claimed.update(_resolve_config_membership_tools(ts_key))
     skip = configurable_keys | plugin_ts_keys | platform_default_keys
     skip |= {k for k in TOOLSETS if k.startswith("hermes-")}
     skip |= set(_DEFAULT_OFF_TOOLSETS) - {platform}

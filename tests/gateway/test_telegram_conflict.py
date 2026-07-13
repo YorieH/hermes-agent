@@ -131,6 +131,8 @@ async def test_polling_conflict_retries_before_fatal(monkeypatch):
 
     assert ok is True
     bot.delete_webhook.assert_awaited_once_with(drop_pending_updates=False)
+    updater.start_polling.assert_awaited_once()
+    assert updater.start_polling.await_args.kwargs["drop_pending_updates"] is False
     assert callable(captured["error_callback"])
 
     conflict = type("Conflict", (Exception,), {})
@@ -550,15 +552,15 @@ def _build_polling_app(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_cold_connect_drops_pending_updates(monkeypatch):
-    """A cold first boot (is_reconnect=False) drops the stale Bot API queue."""
+async def test_cold_connect_preserves_pending_updates(monkeypatch):
+    """A cold first boot preserves messages sent while the gateway was offline."""
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
     captured = _build_polling_app(monkeypatch)
 
     ok = await adapter.connect()  # default is_reconnect=False
 
     assert ok is True
-    assert captured["drop_pending_updates"] is True
+    assert captured["drop_pending_updates"] is False
     await _cancel_heartbeat(adapter)
 
 

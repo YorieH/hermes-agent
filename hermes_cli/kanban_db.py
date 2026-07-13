@@ -73,6 +73,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import json
+import ntpath
 import os
 import re
 import random
@@ -136,6 +137,7 @@ VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+_WINDOWS_PATH_NORMALIZATION = _IS_WINDOWS
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
@@ -2384,6 +2386,193 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _is_review_required_reason(reason: Optional[str]) -> bool:
+    if not reason:
+        return False
+    text = str(reason).strip().casefold()
+    return text.startswith(("review-required", "review_required", "review required"))
+
+
+def _configured_review_coordinator() -> Optional[str]:
+    """Resolve the profile that should review sticky review-required blocks."""
+    try:
+        from hermes_cli.config import load_config
+
+        kanban_cfg = (load_config().get("kanban") or {})
+    except Exception:
+        kanban_cfg = {}
+    raw = (
+        kanban_cfg.get("review_coordinator_profile")
+        or kanban_cfg.get("orchestrator_profile")
+        or ""
+    )
+    coordinator = str(raw).strip()
+    return _canonical_assignee(coordinator) if coordinator else None
+
+
+def _copy_notify_subs(conn: sqlite3.Connection, source_task_id: str, dest_task_id: str) -> None:
+    """Best-effort notification inheritance for generated coordinator cards."""
+    try:
+        for sub in list_notify_subs(conn, source_task_id):
+            add_notify_sub(
+                conn,
+                task_id=dest_task_id,
+                platform=str(sub.get("platform") or ""),
+                chat_id=str(sub.get("chat_id") or ""),
+                thread_id=sub.get("thread_id") or None,
+                user_id=sub.get("user_id") or None,
+                notifier_profile=sub.get("notifier_profile") or None,
+            )
+    except Exception:
+        _log.debug(
+            "failed to copy notify subscriptions from %s to %s",
+            source_task_id,
+            dest_task_id,
+            exc_info=True,
+        )
+
+
+def _maybe_create_coordinator_review_task(
+    conn: sqlite3.Connection,
+    blocked_task: Optional[Task],
+    *,
+    reason: Optional[str],
+    run_id: Optional[int],
+) -> Optional[str]:
+    """Create a coordinator-owned review card for review-required blocks.
+
+    Sticky blocks correctly stop auto-promotion, but without a coordinator
+    card they can still wait for the user to notice and intervene. This
+    bridges that gap: workers can block with ``review-required: ...`` and
+    the configured coordinator gets a concrete ready task to inspect,
+    merge/fix, and unblock the original card.
+    """
+    if blocked_task is None or not _is_review_required_reason(reason):
+        return None
+    if (blocked_task.idempotency_key or "").startswith("coordinator-review:"):
+        return None
+    coordinator = _configured_review_coordinator()
+    if not coordinator:
+        return None
+
+    key = f"coordinator-review:{blocked_task.id}"
+    existing = conn.execute(
+        "SELECT id FROM tasks WHERE (idempotency_key = ? OR idempotency_key LIKE ?) "
+        "AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
+        (key, f"{key}:%"),
+    ).fetchone()
+    if existing:
+        review_task_id = existing["id"]
+        _copy_notify_subs(conn, blocked_task.id, review_task_id)
+        return review_task_id
+
+    body = "\n".join(
+        [
+            f"Coordinate review/unblock for blocked task {blocked_task.id}: {blocked_task.title}",
+            "",
+            f"Original assignee: {blocked_task.assignee or '(unassigned)'}",
+            f"Original workspace: {blocked_task.workspace_kind} @ {blocked_task.workspace_path or '(unresolved)'}",
+            f"Block reason: {reason or ''}",
+            "",
+            "Coordinator responsibilities:",
+            "1. Read the blocked task handoff comments, artifacts, worktree paths, and prior run history.",
+            "2. Resolve integration decisions and merge risks across sibling lanes.",
+            "3. If the work is acceptable, apply or merge it, run the relevant tests, then unblock or complete the original task.",
+            "4. If changes are needed, comment on the original task with precise fixes and route it back to the right assignee.",
+            "5. Completion rule: do not complete this coordinator task until you have called kanban_unblock on the original task, called kanban_complete on the original task, or blocked this coordinator task with a human-only reason.",
+            "",
+            "Do not leave this as a silent human-only blocker unless the decision truly requires Haru.",
+        ]
+    )
+    review_task_id = create_task(
+        conn,
+        title=f"Coordinator review/unblock: {blocked_task.title}",
+        body=body,
+        assignee=coordinator,
+        created_by="kanban",
+        tenant=blocked_task.tenant,
+        priority=max(int(blocked_task.priority or 0), 50),
+        idempotency_key=key,
+        max_runtime_seconds=blocked_task.max_runtime_seconds,
+        session_id=blocked_task.session_id,
+    )
+    _copy_notify_subs(conn, blocked_task.id, review_task_id)
+    with write_txn(conn):
+        _append_event(
+            conn,
+            blocked_task.id,
+            "coordinator_review_requested",
+            {
+                "review_task_id": review_task_id,
+                "coordinator": coordinator,
+                "run_id": run_id,
+                "reason": reason,
+            },
+            run_id=run_id,
+        )
+    return review_task_id
+
+
+def ensure_coordinator_review_tasks(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 50,
+) -> list[str]:
+    """Ensure review-required sticky blocks have coordinator review cards.
+
+    This is intentionally separate from :func:`block_task` so dispatcher
+    ticks can backfill tasks blocked by older already-running workers or by
+    external writers. Returned ids are the review cards that now exist.
+    """
+    ensured: list[str] = []
+    created_count = 0
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE status = 'blocked' ORDER BY created_at ASC"
+    ).fetchall()
+    for row in rows:
+        task_id = row["id"]
+        if not _has_sticky_block(conn, task_id):
+            continue
+        ev = conn.execute(
+            "SELECT payload, run_id FROM task_events "
+            "WHERE task_id = ? AND kind = 'blocked' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if not ev:
+            continue
+        reason = None
+        try:
+            payload = json.loads(ev["payload"] or "{}")
+            if isinstance(payload, dict):
+                reason = payload.get("reason")
+        except Exception:
+            reason = None
+        if not _is_review_required_reason(reason):
+            continue
+        key = f"coordinator-review:{task_id}"
+        existing = conn.execute(
+            "SELECT id FROM tasks WHERE (idempotency_key = ? OR idempotency_key LIKE ?) "
+            "AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
+            (key, f"{key}:%"),
+        ).fetchone()
+        if existing:
+            ensured.append(existing["id"])
+            continue
+        if limit and created_count >= limit:
+            continue
+        review_task_id = _maybe_create_coordinator_review_task(
+            conn,
+            get_task(conn, task_id),
+            reason=reason,
+            run_id=ev["run_id"],
+        )
+        if review_task_id:
+            ensured.append(review_task_id)
+            created_count += 1
+    return ensured
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3376,6 +3565,8 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    enforce_workspace_lease: bool = False,
+    board: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -3411,6 +3602,14 @@ def claim_task(
                 {"reason": "parents_not_done"},
             )
             return None
+        if enforce_workspace_lease:
+            collision = _workspace_lease_collision(conn, task_id, board=board)
+            if collision is not None:
+                owner_task_id, lease_path = collision
+                _record_workspace_guarded_event(
+                    conn, task_id, owner_task_id, lease_path
+                )
+                return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
         # it when the CAS resets the pointer below. No-op when the invariant
@@ -3498,6 +3697,8 @@ def claim_review_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    enforce_workspace_lease: bool = False,
+    board: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
 
@@ -3515,6 +3716,14 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if enforce_workspace_lease:
+            collision = _workspace_lease_collision(conn, task_id, board=board)
+            if collision is not None:
+                owner_task_id, lease_path = collision
+                _record_workspace_guarded_event(
+                    conn, task_id, owner_task_id, lease_path
+                )
+                return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -4823,6 +5032,23 @@ def block_task(
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
         # a dependency-wait as something to "unblock".
         if kind == "dependency":
+            nonterminal_parent = conn.execute(
+                """
+                SELECT p.id
+                  FROM task_links AS l
+                  JOIN tasks AS p ON p.id = l.parent_id
+                 WHERE l.child_id = ?
+                   AND p.status NOT IN ('done', 'archived')
+                 LIMIT 1
+                """,
+                (task_id,),
+            ).fetchone()
+            if nonterminal_parent is None:
+                raise ValueError(
+                    "dependency block requires at least one linked non-terminal "
+                    "parent; create/link the dependency first or use "
+                    "kind='capability' for an external prerequisite"
+                )
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -4966,6 +5192,12 @@ def block_task(
                 run_id=run_id,
             )
         _blocked_task = get_task(conn, task_id)
+    _coordinator_review_task_id = _maybe_create_coordinator_review_task(
+        conn,
+        _blocked_task,
+        reason=reason,
+        run_id=run_id,
+    )
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
         task_id,
@@ -4973,6 +5205,7 @@ def block_task(
         assignee=_blocked_task.assignee if _blocked_task else None,
         run_id=run_id,
         reason=reason,
+        coordinator_review_task_id=_coordinator_review_task_id,
     )
     return True
 
@@ -5428,8 +5661,26 @@ def decompose_triage_task(
     return child_ids
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def archive_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    allow_running: bool = True,
+) -> bool:
     with write_txn(conn):
+        if not allow_running:
+            row = conn.execute(
+                "SELECT status, claim_lock, current_run_id FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["status"] == "archived"
+                or row["status"] == "running"
+                or row["claim_lock"]
+                or row["current_run_id"] is not None
+            ):
+                return False
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -5452,6 +5703,72 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # for a later dispatcher tick.
     recompute_ready(conn)
     return True
+
+
+def _known_skill_names_for_profile(profile: str) -> set[str]:
+    """Best-effort skill index for dispatcher preflight.
+
+    If indexing fails, callers should allow dispatch to proceed; the worker's
+    own `--skills` loading remains the source of truth. This guard only catches
+    the common local/bundled missing-skill case before a worker is spawned.
+    """
+    names: set[str] = set()
+    try:
+        from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+        from hermes_cli.profiles import resolve_profile_env
+        from hermes_constants import get_bundled_skills_dir, get_optional_skills_dir
+        from tools.skills_tool import _parse_frontmatter
+
+        roots = [
+            Path(resolve_profile_env(profile)) / "skills",
+            get_bundled_skills_dir(),
+            get_optional_skills_dir(),
+            *get_external_skills_dirs(),
+        ]
+        for root in roots:
+            if not root.exists():
+                continue
+            for skill_md in iter_skill_index_files(root, "SKILL.md"):
+                try:
+                    rel_parent = skill_md.parent.relative_to(root).as_posix()
+                except ValueError:
+                    rel_parent = skill_md.parent.name
+                if rel_parent:
+                    names.add(rel_parent)
+                    names.add(skill_md.parent.name)
+                try:
+                    content = skill_md.read_text(encoding="utf-8")
+                    frontmatter, _ = _parse_frontmatter(content)
+                except Exception:
+                    frontmatter = {}
+                frontmatter_name = str(frontmatter.get("name") or "").strip()
+                if frontmatter_name:
+                    names.add(frontmatter_name)
+    except Exception:
+        return set()
+    return names
+
+
+def missing_worker_skills(profile: str, skills: list[str] | None) -> list[str]:
+    """Return requested skills not visible to a worker profile.
+
+    Empty means either everything is visible or the lightweight index could not
+    safely decide. The dispatcher must not block exotic/plugin skills just
+    because the preflight cannot inspect them.
+    """
+    requested = [str(s).strip() for s in (skills or []) if str(s).strip()]
+    if not requested:
+        return []
+    known = _known_skill_names_for_profile(profile)
+    if not known:
+        return []
+    # Qualified plugin skills are resolved by the worker's skill manager and
+    # may not have a filesystem directory matching ``namespace:skill``.
+    # Preflight must fail open for those names instead of blocking valid work.
+    return [
+        skill for skill in requested
+        if skill not in known and ":" not in skill
+    ]
 
 
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -5726,6 +6043,110 @@ def _resolve_worktree_workspace(
     return requested, branch_name
 
 
+def _normalize_workspace_lease_path(path: Path | str) -> str:
+    """Return the platform-canonical absolute key used for workspace leases."""
+    raw = os.path.expanduser(str(path))
+    if _WINDOWS_PATH_NORMALIZATION:
+        # ntpath gives deterministic Windows semantics even when a Windows-form
+        # board DB is inspected from a non-Windows test or recovery host.
+        return ntpath.normcase(ntpath.normpath(ntpath.abspath(raw)))
+    return os.path.normcase(str(Path(raw).resolve(strict=False)))
+
+
+def _workspace_lease_path(task: Task, *, board: Optional[str] = None) -> Optional[str]:
+    """Resolve a task's effective workspace without creating it.
+
+    Worktree repo-root anchors become their per-task ``.worktrees/<id>`` target,
+    so two isolated worktrees remain parallel while two tasks naming the same
+    concrete checkout collide.
+    """
+    kind = task.workspace_kind or "scratch"
+    raw_path = task.workspace_path
+    if kind == "scratch":
+        raw_path = raw_path or str(workspaces_root(board=board) / task.id)
+    elif kind == "dir":
+        if not raw_path:
+            return None
+    elif kind == "worktree":
+        if not raw_path:
+            board_slug = board if board else get_current_board()
+            raw_path = (
+                read_board_metadata(board_slug).get("default_workdir") or ""
+            ).strip()
+            if not raw_path:
+                return None
+        requested = Path(raw_path).expanduser()
+        if requested.exists() and _is_linked_worktree_checkout(requested):
+            raw_path = str(requested.resolve(strict=False))
+        else:
+            repo_root = _git_toplevel(requested)
+            if repo_root is not None and requested.resolve(strict=False) == repo_root:
+                raw_path = str(repo_root / ".worktrees" / task.id)
+    else:
+        return None
+    return _normalize_workspace_lease_path(raw_path)
+
+
+def _active_workspace_leases(
+    conn: sqlite3.Connection, *, board: Optional[str] = None
+) -> dict[str, str]:
+    """Map normalized workspace paths to live same-board task owners."""
+    leases: dict[str, str] = {}
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE status = 'running' AND claim_lock IS NOT NULL "
+        "ORDER BY started_at ASC, created_at ASC"
+    ).fetchall()
+    for row in rows:
+        task = get_task(conn, row["id"])
+        if task is None:
+            continue
+        lease_path = _workspace_lease_path(task, board=board)
+        if lease_path:
+            leases.setdefault(lease_path, task.id)
+    return leases
+
+
+def _workspace_lease_collision(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[tuple[str, str]]:
+    """Return ``(owner_task_id, normalized_path)`` for a live collision."""
+    task = get_task(conn, task_id)
+    if task is None:
+        return None
+    lease_path = _workspace_lease_path(task, board=board)
+    if not lease_path:
+        return None
+    owner = _active_workspace_leases(conn, board=board).get(lease_path)
+    if owner and owner != task_id:
+        return owner, lease_path
+    return None
+
+
+def _record_workspace_guarded_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    owner_task_id: str,
+    lease_path: str,
+) -> None:
+    """Append one diagnostic per unchanged collision, without tick spam."""
+    payload = {"owner_task_id": owner_task_id, "workspace_path": lease_path}
+    latest = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if latest is not None and latest["kind"] == "workspace_guarded":
+        try:
+            if json.loads(latest["payload"] or "{}") == payload:
+                return
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    _append_event(conn, task_id, "workspace_guarded", payload)
+
+
 def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
@@ -5942,6 +6363,9 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    workspace_guarded: list[tuple[str, str, str]] = field(default_factory=list)
+    """Tasks deferred because a live same-board worker owns the same normalized
+    mutable workspace, as ``(task_id, owner_task_id, workspace_path)`` triples."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -6006,6 +6430,49 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
             _recent_worker_exits.pop(_pid, None)
 
 
+def _decode_worker_exit_status(raw: int) -> "tuple[str, Optional[int]]":
+    """Decode a child-process wait status into a kanban worker exit kind.
+
+    POSIX ``waitpid`` returns a packed wait status where the exit code lives in
+    the high byte. Windows and some tests may hand us a plain process return
+    code. Accept both forms so rate-limit sentinel handling is not platform
+    fragile.
+    """
+    if raw == 0:
+        return ("clean_exit", 0)
+    if 0 < raw < 256:
+        if raw == KANBAN_RATE_LIMIT_EXIT_CODE:
+            return ("rate_limited", raw)
+        return ("nonzero_exit", raw)
+
+    try:
+        if hasattr(os, "WIFEXITED") and os.WIFEXITED(raw):
+            code = os.WEXITSTATUS(raw)
+            # On POSIX this is already the high-byte exit code. On Windows,
+            # Python exposes the helpers but can return the raw packed value.
+            if code == raw and raw > 255 and raw & 0xFF == 0:
+                code = raw >> 8
+            if code == 0:
+                return ("clean_exit", 0)
+            if code == KANBAN_RATE_LIMIT_EXIT_CODE:
+                return ("rate_limited", code)
+            return ("nonzero_exit", code)
+        if hasattr(os, "WIFSIGNALED") and os.WIFSIGNALED(raw):
+            return ("signaled", os.WTERMSIG(raw))
+    except Exception:
+        pass
+
+    if raw > 255 and raw & 0xFF == 0:
+        code = raw >> 8
+        if code == 0:
+            return ("clean_exit", 0)
+        if code == KANBAN_RATE_LIMIT_EXIT_CODE:
+            return ("rate_limited", code)
+        return ("nonzero_exit", code)
+
+    return ("unknown", None)
+
+
 def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     """Classify a recently-reaped worker by pid.
 
@@ -6034,19 +6501,7 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     if entry is None:
         return ("unknown", None)
     raw, _ = entry
-    try:
-        if os.WIFEXITED(raw):
-            code = os.WEXITSTATUS(raw)
-            if code == 0:
-                return ("clean_exit", 0)
-            if code == KANBAN_RATE_LIMIT_EXIT_CODE:
-                return ("rate_limited", code)
-            return ("nonzero_exit", code)
-        if os.WIFSIGNALED(raw):
-            return ("signaled", os.WTERMSIG(raw))
-    except Exception:
-        pass
-    return ("unknown", None)
+    return _decode_worker_exit_status(raw)
 
 
 def reap_worker_zombies() -> "list[int]":
@@ -6176,6 +6631,8 @@ def _terminate_reclaimed_worker(
         info["terminated"] = True
         return info
     except OSError:
+        if not _pid_alive(pid):
+            info["terminated"] = True
         return info
 
     for _ in range(10):
@@ -6747,6 +7204,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 error=error_text,
                 outcome="crashed",
                 failure_limit=1 if (protocol_violation or is_systemic) else None,
+                override_task_max_retries=bool(protocol_violation or is_systemic),
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer},
@@ -6771,6 +7229,7 @@ def _record_task_failure(
     *,
     outcome: str,
     failure_limit: int = None,
+    override_task_max_retries: bool = False,
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
@@ -6804,7 +7263,8 @@ def _record_task_failure(
     context (e.g. pid on crash, elapsed on timeout).
 
     Resolution order for the effective threshold:
-      1. per-task ``max_retries`` if set (nothing else overrides)
+      1. per-task ``max_retries`` if set (unless
+         ``override_task_max_retries`` is true for deterministic breakers)
       2. caller-supplied ``failure_limit`` (gateway passes the config
          value from ``kanban.failure_limit``; tests pass fixed values)
       3. ``DEFAULT_FAILURE_LIMIT``
@@ -6827,12 +7287,12 @@ def _record_task_failure(
         task_override = (
             row["max_retries"] if "max_retries" in row.keys() else None
         )
-        if task_override is not None:
+        if task_override is not None and not override_task_max_retries:
             effective_limit = int(task_override)
             limit_source = "task"
         else:
             effective_limit = int(failure_limit)
-            limit_source = "dispatcher"
+            limit_source = "forced" if override_task_max_retries else "dispatcher"
 
         if failures >= effective_limit:
             # Trip the breaker.
@@ -7184,6 +7644,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    default_max_runtime_seconds: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -7218,6 +7679,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            default_max_runtime_seconds=default_max_runtime_seconds,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -7234,6 +7696,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            default_max_runtime_seconds=default_max_runtime_seconds,
         )
 
 
@@ -7250,6 +7713,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    default_max_runtime_seconds: Optional[int] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -7278,6 +7742,10 @@ def _dispatch_once_locked(
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
     ``board`` pins workspace/log/db resolution for this tick to a specific
     board. When omitted, the current-board resolution chain is used.
+
+    Workspace leases are atomic within this board DB. Separate boards use
+    separate SQLite writer locks, so they cannot safely coordinate the same
+    checkout without a future shared cross-board lease registry.
     """
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
@@ -7307,6 +7775,7 @@ def _dispatch_once_locked(
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+    ensure_coordinator_review_tasks(conn)
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -7315,8 +7784,16 @@ def _dispatch_once_locked(
     # board, since "running" tasks aren't reclaimed by completion alone —
     # they sit in status='running' until the worker calls
     # kanban_complete/kanban_block (or the dispatcher TTL-reclaims them).
+    # Both values are live concurrency caps. When both are configured, the
+    # stricter one wins. Keep this as a total-worker cap rather than turning
+    # max_in_progress into a remaining-slot count: with three running workers
+    # and both caps at five, there are two slots to fill (not zero).
+    configured_caps = [
+        cap for cap in (max_spawn, max_in_progress) if cap is not None
+    ]
+    effective_concurrency_cap = min(configured_caps) if configured_caps else None
     running_count = 0
-    if max_spawn is not None:
+    if effective_concurrency_cap is not None:
         running_count = int(
             conn.execute(
                 "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
@@ -7332,17 +7809,19 @@ def _dispatch_once_locked(
     # tasks, skip spawning this tick so slow workers (local LLMs,
     # resource-constrained hosts) can finish what they have before more tasks
     # pile up and time out.
-    if max_in_progress is not None and ready_rows:
-        in_progress = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-        ).fetchone()[0]
-        if in_progress >= max_in_progress:
-            return result
-        # Only spawn enough to reach the cap, respecting max_spawn too.
-        remaining = max_in_progress - in_progress
-        if max_spawn is None or max_spawn > remaining:
-            max_spawn = remaining
+    if (
+        ready_rows
+        and effective_concurrency_cap is not None
+        and running_count >= effective_concurrency_cap
+    ):
+        return result
     spawned = 0
+    try:
+        default_runtime_cap = int(default_max_runtime_seconds or 0)
+    except (TypeError, ValueError):
+        default_runtime_cap = 0
+    if default_runtime_cap < 1:
+        default_runtime_cap = 0
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
     # when this would push that assignee past the cap. Prevents
@@ -7379,8 +7858,12 @@ def _dispatch_once_locked(
             # bucket it as nonspawnable if the profile genuinely isn't
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
+    _workspace_leases = _active_workspace_leases(conn, board=board)
     for row in ready_rows:
-        if max_spawn is not None and running_count + spawned >= max_spawn:
+        if (
+            effective_concurrency_cap is not None
+            and running_count + spawned >= effective_concurrency_cap
+        ):
             break
         row_assignee = row["assignee"]
         if not row_assignee:
@@ -7449,6 +7932,63 @@ def _dispatch_once_locked(
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
             continue
+        task_for_skill_check = get_task(conn, row["id"])
+        lease_path = (
+            _workspace_lease_path(task_for_skill_check, board=board)
+            if task_for_skill_check is not None else None
+        )
+        lease_owner = _workspace_leases.get(lease_path) if lease_path else None
+        if lease_owner and lease_owner != row["id"]:
+            result.workspace_guarded.append(
+                (row["id"], lease_owner, lease_path)
+            )
+            if not dry_run:
+                with write_txn(conn):
+                    _record_workspace_guarded_event(
+                        conn, row["id"], lease_owner, lease_path
+                    )
+            continue
+        missing_skills = missing_worker_skills(
+            row_assignee,
+            task_for_skill_check.skills if task_for_skill_check else None,
+        )
+        if missing_skills:
+            msg = (
+                "missing worker skill(s) for profile "
+                f"{row_assignee}: {', '.join(missing_skills)}"
+            )
+            if not dry_run:
+                # Skill availability is deterministic and this check runs
+                # before a claim/run exists. The generic spawn helper updates
+                # only running rows below its threshold, so using it here made
+                # the failure counter stay at zero forever. Block immediately
+                # and require an explicit requeue after the assignment or
+                # profile is repaired.
+                auto = _record_task_failure(
+                    conn,
+                    row["id"],
+                    msg,
+                    outcome="spawn_failed",
+                    failure_limit=1,
+                    override_task_max_retries=True,
+                    release_claim=False,
+                    end_run=False,
+                    event_payload_extra={"deterministic": True},
+                )
+                with write_txn(conn):
+                    _append_event(
+                        conn,
+                        row["id"],
+                        "skill_preflight_failed",
+                        {
+                            "profile": row_assignee,
+                            "missing": missing_skills,
+                            "deterministic": True,
+                        },
+                    )
+                if auto:
+                    result.auto_blocked.append(row["id"])
+            continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
         # its in-flight cap. Prevents one profile's local model / API
@@ -7478,13 +8018,30 @@ def _dispatch_once_locked(
             # this the task appears stuck in ready with no diagnosis.
             if not dry_run:
                 with write_txn(conn):
-                    _append_event(
-                        conn, row["id"], "respawn_guarded",
-                        {"reason": guard_reason},
-                    )
+                    latest = conn.execute(
+                        "SELECT kind, payload FROM task_events "
+                        "WHERE task_id = ? AND kind = 'respawn_guarded' "
+                        "ORDER BY id DESC LIMIT 1",
+                        (row["id"],),
+                    ).fetchone()
+                    latest_reason = None
+                    if latest is not None:
+                        try:
+                            latest_reason = (
+                                json.loads(latest["payload"] or "{}") or {}
+                            ).get("reason")
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            latest_reason = None
+                    if latest_reason != guard_reason:
+                        _append_event(
+                            conn, row["id"], "respawn_guarded",
+                            {"reason": guard_reason},
+                        )
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
+            if lease_path:
+                _workspace_leases[lease_path] = row["id"]
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
@@ -7494,8 +8051,27 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        if default_runtime_cap:
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET max_runtime_seconds = ? "
+                    "WHERE id = ? AND max_runtime_seconds IS NULL",
+                    (default_runtime_cap, row["id"]),
+                )
+        claimed = claim_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            enforce_workspace_lease=True,
+            board=board,
+        )
         if claimed is None:
+            collision = _workspace_lease_collision(conn, row["id"], board=board)
+            if collision is not None:
+                owner_task_id, collision_path = collision
+                result.workspace_guarded.append(
+                    (row["id"], owner_task_id, collision_path)
+                )
             continue
         try:
             resolved_branch_name = None
@@ -7541,6 +8117,9 @@ def _dispatch_once_locked(
             # complete_task).
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
+            _workspace_leases[
+                _normalize_workspace_lease_path(workspace)
+            ] = claimed.id
             # Track the new in-flight count for this profile so later
             # iterations in this same tick respect the per-profile cap
             # (#21582). Subsequent ticks re-query from the DB.
@@ -7583,11 +8162,51 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
+        review_task = get_task(conn, row["id"])
+        review_lease_path = (
+            _workspace_lease_path(review_task, board=board)
+            if review_task is not None else None
+        )
+        review_lease_owner = (
+            _workspace_leases.get(review_lease_path)
+            if review_lease_path else None
+        )
+        if review_lease_owner and review_lease_owner != row["id"]:
+            result.workspace_guarded.append(
+                (row["id"], review_lease_owner, review_lease_path)
+            )
+            if not dry_run:
+                with write_txn(conn):
+                    _record_workspace_guarded_event(
+                        conn, row["id"], review_lease_owner, review_lease_path
+                    )
+            continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
+            if review_lease_path:
+                _workspace_leases[review_lease_path] = row["id"]
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        if default_runtime_cap:
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET max_runtime_seconds = ? "
+                    "WHERE id = ? AND max_runtime_seconds IS NULL",
+                    (default_runtime_cap, row["id"]),
+                )
+        claimed = claim_review_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            enforce_workspace_lease=True,
+            board=board,
+        )
         if claimed is None:
+            collision = _workspace_lease_collision(conn, row["id"], board=board)
+            if collision is not None:
+                owner_task_id, collision_path = collision
+                result.workspace_guarded.append(
+                    (row["id"], owner_task_id, collision_path)
+                )
             continue
         try:
             resolved_branch_name = None
@@ -7629,6 +8248,9 @@ def _dispatch_once_locked(
                 _set_worker_pid(conn, claimed.id, int(pid))
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
+            _workspace_leases[
+                _normalize_workspace_lease_path(workspace)
+            ] = claimed.id
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
@@ -7929,6 +8551,7 @@ def _default_spawn(
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+    _prepare_worker_session_env(env, task, board=board)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -8088,6 +8711,71 @@ def _default_spawn(
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
     return proc.pid
+
+
+_WORKER_SESSION_ENV_KEYS = (
+    "HERMES_SESSION_ID",
+    "HERMES_SESSION_PROFILE",
+    "HERMES_SESSION_PLATFORM",
+    "HERMES_SESSION_SOURCE",
+    "HERMES_SESSION_CHAT_ID",
+    "HERMES_SESSION_CHAT_NAME",
+    "HERMES_SESSION_THREAD_ID",
+    "HERMES_SESSION_USER_ID",
+    "HERMES_SESSION_USER_NAME",
+    "HERMES_SESSION_KEY",
+    "HERMES_SESSION_MESSAGE_ID",
+    "HERMES_KANBAN_NOTIFIER_PROFILE",
+)
+
+
+def _prepare_worker_session_env(
+    env: dict[str, str],
+    task: Task,
+    *,
+    board: Optional[str] = None,
+) -> None:
+    """Pin worker notification routing to the task's subscription.
+
+    Dispatcher workers inherit the gateway process environment. That env can
+    contain stale session variables, so clear routing first, then copy the
+    parent task's notification subscription when one exists. Child tasks the
+    worker creates can then auto-subscribe back to the same chat.
+    """
+    for key in _WORKER_SESSION_ENV_KEYS:
+        env.pop(key, None)
+    if task.session_id:
+        env["HERMES_SESSION_ID"] = task.session_id
+
+    try:
+        conn = connect(board=board)
+        try:
+            subs = list_notify_subs(conn, task.id)
+        finally:
+            conn.close()
+    except Exception:
+        return
+
+    sub = next(
+        (
+            s for s in subs
+            if (s.get("platform") or "") and (s.get("chat_id") or "")
+        ),
+        None,
+    )
+    if not sub:
+        return
+
+    env["HERMES_SESSION_PLATFORM"] = str(sub.get("platform") or "")
+    env["HERMES_SESSION_CHAT_ID"] = str(sub.get("chat_id") or "")
+    if sub.get("thread_id"):
+        env["HERMES_SESSION_THREAD_ID"] = str(sub["thread_id"])
+    if sub.get("user_id"):
+        env["HERMES_SESSION_USER_ID"] = str(sub["user_id"])
+    if sub.get("notifier_profile"):
+        env["HERMES_KANBAN_NOTIFIER_PROFILE"] = str(sub["notifier_profile"])
+    if str(sub.get("platform") or "").lower() == "tui":
+        env["HERMES_SESSION_KEY"] = str(sub.get("chat_id") or "")
 
 
 # ---------------------------------------------------------------------------
@@ -8809,8 +9497,13 @@ def list_profiles_on_disk() -> list[str]:
     path).
     """
     try:
-        from hermes_constants import get_default_hermes_root
-        default_root = get_default_hermes_root()
+        home_env = os.environ.get("HERMES_HOME")
+        if home_env:
+            default_root = Path(home_env).expanduser()
+            if default_root.parent.name == "profiles":
+                default_root = default_root.parent.parent
+        else:
+            default_root = Path.home() / ".hermes"
         profiles_dir = default_root / "profiles"
     except Exception:
         return []

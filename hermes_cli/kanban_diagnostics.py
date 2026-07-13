@@ -818,13 +818,22 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
     window_seconds = float(cfg.get("block_cycle_window_seconds", 24 * 3600))
     cycle_cutoff = now - window_seconds
 
+    def _block_reason_signature(ev) -> str:
+        payload = _parse_payload(ev)
+        reason = str(payload.get("reason") or "").strip().casefold()
+        if not reason:
+            return "(no reason supplied)"
+        return " ".join(reason.split())[:240]
+
     # Walk events chronologically (arrival order — callers pre-sort by
     # id, which is the canonical chronological order; ``created_at``
     # alone is insufficient because multiple events can share the same
-    # second).  Count "blocked after unblocked" transitions: every time
-    # a blocked event follows at least one unblocked event since the
-    # last cycle was counted, that's a new cycle.
-    cycles = 0
+    # second). Count "blocked after unblocked" transitions by normalized
+    # block reason. Long-lived coordinator cards legitimately use
+    # block/unblock as review checkpoints across different slices; that
+    # should not look like a stuck loop. The diagnostic is meant for the
+    # same wall recurring after unblocks.
+    cycles_by_reason: dict[str, int] = {}
     seen_unblock_since_last_cycle = False
     initial_blocked_ts = 0
     last_cycle_blocked_ts = 0
@@ -837,11 +846,20 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
             if initial_blocked_ts == 0:
                 initial_blocked_ts = ts
             if seen_unblock_since_last_cycle:
-                cycles += 1
+                reason_sig = _block_reason_signature(ev)
+                cycles_by_reason[reason_sig] = cycles_by_reason.get(reason_sig, 0) + 1
                 last_cycle_blocked_ts = ts
                 seen_unblock_since_last_cycle = False
         elif kind == "unblocked":
             seen_unblock_since_last_cycle = True
+
+    if cycles_by_reason:
+        repeated_reason, cycles = max(
+            cycles_by_reason.items(),
+            key=lambda item: (item[1], item[0]),
+        )
+    else:
+        repeated_reason, cycles = "", 0
 
     if cycles < threshold:
         return []
@@ -861,8 +879,9 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
         title=f"Task block→unblock cycled {cycles}x in {int(window_seconds/3600)}h",
         detail=(
             f"This task has been blocked {cycles} times after being "
-            "unblocked, suggesting the unblock is not addressing the "
-            "root cause and the worker keeps hitting the same wall. "
+            "unblocked for the same or very similar reason, suggesting "
+            "the unblock is not addressing the root cause and the worker "
+            "keeps hitting the same wall. "
             "Review the block reasons in the event history; a different "
             "intervention (reassign, change scope, archive) may be needed."
         ),
@@ -872,6 +891,8 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
         count=cycles,
         data={
             "cycles": cycles,
+            "all_cycle_count": sum(cycles_by_reason.values()),
+            "repeated_reason": repeated_reason,
             "window_seconds": int(window_seconds),
         },
     )]

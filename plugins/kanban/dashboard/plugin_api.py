@@ -878,7 +878,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     # Direct status write for drag-drop (todo -> ready etc).
                     ok = _set_status_direct(conn, task_id, "ready")
             elif s == "archived":
-                ok = kanban_db.archive_task(conn, task_id)
+                ok = kanban_db.archive_task(conn, task_id, allow_running=False)
             elif s == "running":
                 raise HTTPException(
                     status_code=400,
@@ -1197,7 +1197,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     results.append(entry)
                     continue
                 if payload.archive:
-                    if not kanban_db.archive_task(conn, tid):
+                    if not kanban_db.archive_task(conn, tid, allow_running=False):
                         entry.update(ok=False, error="archive refused")
                 if payload.status is not None and not payload.archive:
                     s = payload.status

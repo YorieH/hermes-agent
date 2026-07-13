@@ -1793,6 +1793,200 @@ def test_dispatch_max_spawn_fills_remaining_capacity(
         assert kb.get_task(conn, ready_b).status == "ready"
 
 
+def test_dispatch_defers_same_mutable_workspace_across_assignees(
+    kanban_home, all_assignees_spawnable, tmp_path,
+):
+    shared = tmp_path / "shared-checkout"
+
+    with kb.connect() as conn:
+        owner = kb.create_task(
+            conn, title="owner", assignee="alice",
+            workspace_kind="dir", workspace_path=str(shared),
+        )
+        waiting = kb.create_task(
+            conn, title="waiting", assignee="bob",
+            workspace_kind="dir", workspace_path=str(shared),
+        )
+        kb.claim_task(conn, owner)
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: pytest.fail("must not spawn"),
+        )
+
+        assert result.workspace_guarded == [
+            (waiting, owner, kb._normalize_workspace_lease_path(str(shared)))
+        ]
+        assert kb.get_task(conn, waiting).status == "ready"
+
+
+def test_dispatch_windows_workspace_guard_normalizes_case_separators_and_segments(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    monkeypatch.setattr(kb, "_WINDOWS_PATH_NORMALIZATION", True)
+
+    with kb.connect() as conn:
+        owner = kb.create_task(
+            conn, title="owner", assignee="alice",
+            workspace_kind="dir",
+            workspace_path=r"C:\Users\Haru\Project\..\Repo",
+        )
+        waiting = kb.create_task(
+            conn, title="waiting", assignee="bob",
+            workspace_kind="dir",
+            workspace_path="c:/users/haru/repo/./",
+        )
+        kb.claim_task(conn, owner)
+
+        result = kb.dispatch_once(conn, dry_run=True)
+
+        assert [(task_id, owner_id) for task_id, owner_id, _path in result.workspace_guarded] == [
+            (waiting, owner)
+        ]
+        assert result.spawned == []
+
+
+def test_dispatch_dry_run_allows_distinct_worktree_paths(
+    kanban_home, all_assignees_spawnable, tmp_path,
+):
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn, title="first", assignee="alice",
+            workspace_kind="worktree", workspace_path=str(tmp_path / "wt-a"),
+        )
+        second = kb.create_task(
+            conn, title="second", assignee="bob",
+            workspace_kind="worktree", workspace_path=str(tmp_path / "wt-b"),
+        )
+
+        result = kb.dispatch_once(conn, dry_run=True)
+
+        assert [task_id for task_id, _assignee, _path in result.spawned] == [
+            first, second,
+        ]
+        assert result.workspace_guarded == []
+
+
+def test_dispatch_guards_same_concrete_linked_worktree(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    linked = tmp_path / "linked-worktree"
+    linked.mkdir()
+    monkeypatch.setattr(kb, "_is_linked_worktree_checkout", lambda _path: True)
+    monkeypatch.setattr(
+        kb, "_git_toplevel", lambda path: Path(path).resolve(strict=False)
+    )
+
+    with kb.connect() as conn:
+        owner = kb.create_task(
+            conn, title="owner", assignee="alice",
+            workspace_kind="worktree", workspace_path=str(linked),
+        )
+        waiting = kb.create_task(
+            conn, title="waiting", assignee="bob",
+            workspace_kind="worktree", workspace_path=str(linked),
+        )
+        kb.claim_task(conn, owner)
+
+        result = kb.dispatch_once(conn, dry_run=True)
+
+        assert result.workspace_guarded[0][:2] == (waiting, owner)
+        assert result.spawned == []
+
+
+@pytest.mark.parametrize("release", ["completed", "blocked"])
+def test_dispatch_workspace_lease_releases_on_terminal_status(
+    kanban_home, all_assignees_spawnable, tmp_path, release,
+):
+    shared = tmp_path / "shared-checkout"
+    spawns = []
+
+    with kb.connect() as conn:
+        owner = kb.create_task(
+            conn, title="owner", assignee="alice",
+            workspace_kind="dir", workspace_path=str(shared),
+        )
+        waiting = kb.create_task(
+            conn, title="waiting", assignee="bob",
+            workspace_kind="dir", workspace_path=str(shared),
+        )
+        kb.claim_task(conn, owner)
+        if release == "completed":
+            kb.complete_task(conn, owner)
+        else:
+            kb.block_task(conn, owner, reason="paused")
+
+        result = kb.dispatch_once(
+            conn, spawn_fn=lambda task, _workspace: spawns.append(task.id)
+        )
+
+        assert spawns == [waiting]
+        assert result.workspace_guarded == []
+
+
+def test_dispatch_workspace_lease_releases_after_reclaim(
+    kanban_home, all_assignees_spawnable, monkeypatch, tmp_path,
+):
+    shared = tmp_path / "shared-checkout"
+    spawns = []
+
+    with kb.connect() as conn:
+        owner = kb.create_task(
+            conn, title="stale owner", assignee="alice", priority=0,
+            workspace_kind="dir", workspace_path=str(shared),
+        )
+        waiting = kb.create_task(
+            conn, title="waiting", assignee="bob", priority=10,
+            workspace_kind="dir", workspace_path=str(shared),
+        )
+        kb.claim_task(conn, owner)
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 1, owner),
+        )
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+        result = kb.dispatch_once(
+            conn, spawn_fn=lambda task, _workspace: spawns.append(task.id)
+        )
+
+        assert result.reclaimed == 1
+        assert spawns == [waiting]
+        assert (owner, waiting) == tuple(result.workspace_guarded[0][:2])
+
+
+def test_dispatch_workspace_guard_dry_run_has_no_writes_or_duplicate_event_spam(
+    kanban_home, all_assignees_spawnable, tmp_path,
+):
+    shared = tmp_path / "shared-checkout"
+
+    with kb.connect() as conn:
+        owner = kb.create_task(
+            conn, title="owner", assignee="alice",
+            workspace_kind="dir", workspace_path=str(shared),
+        )
+        waiting = kb.create_task(
+            conn, title="waiting", assignee="bob",
+            workspace_kind="dir", workspace_path=str(shared),
+        )
+        kb.claim_task(conn, owner)
+
+        dry_result = kb.dispatch_once(conn, dry_run=True)
+        assert dry_result.workspace_guarded[0][:2] == (waiting, owner)
+        assert not any(e.kind == "workspace_guarded" for e in kb.list_events(conn, waiting))
+
+        kb.dispatch_once(conn)
+        kb.dispatch_once(conn)
+        guarded_events = [
+            e for e in kb.list_events(conn, waiting)
+            if e.kind == "workspace_guarded"
+        ]
+
+        assert len(guarded_events) == 1
+        assert kb.get_task(conn, owner).status == "running"
+        assert kb.get_task(conn, waiting).status == "ready"
+
+
 def test_dispatch_reclaims_stale_before_spawning(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="alice")
@@ -2098,6 +2292,27 @@ def test_dispatch_respawn_guard_emits_event_for_skipped_task(
     assert guarded_evt.payload.get("reason") == "recent_success"
 
 
+def test_respawn_guard_deduplicates_across_interleaved_events(
+    kanban_home, all_assignees_spawnable
+):
+    """Heartbeats/comments between ticks must not re-emit the same guard."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="guard-dedup", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (task_id, now - 300, now - 60),
+        )
+        kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        with kb.write_txn(conn):
+            kb._append_event(conn, task_id, "heartbeat", {"source": "test"})
+        kb.dispatch_once(conn, spawn_fn=lambda task, ws: None)
+        events = kb.list_events(conn, task_id)
+
+    assert sum(event.kind == "respawn_guarded" for event in events) == 1
+
+
 # ---------------------------------------------------------------------------
 # Workspace resolution
 # ---------------------------------------------------------------------------
@@ -2159,7 +2374,7 @@ def test_worktree_workspace_repo_root_anchor_materializes_linked_worktree(kanban
         capture_output=True,
         text=True,
     ).stdout
-    assert f"worktree {expected}" in listed
+    assert f"worktree {expected.as_posix()}" in listed
     assert f"branch refs/heads/wt/{t}" in listed
 
 
@@ -2243,7 +2458,7 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
         capture_output=True,
         text=True,
     ).stdout
-    assert f"worktree {target}" in listed
+    assert f"worktree {target.as_posix()}" in listed
     assert f"branch refs/heads/{branch}" in listed
 
 
@@ -2282,7 +2497,7 @@ def test_dispatch_worktree_task_persists_materialized_workspace_and_branch(kanba
         capture_output=True,
         text=True,
     ).stdout
-    assert f"worktree {expected}" in listed
+    assert f"worktree {expected.as_posix()}" in listed
     assert f"branch refs/heads/wt/{tid}" in listed
 
 
@@ -2341,8 +2556,8 @@ def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch
         capture_output=True,
         text=True,
     ).stdout
-    assert listed.count(f"worktree {expected}\n") == 1
-    assert f"worktree {expected}/.worktrees/{tid}" not in listed
+    assert listed.count(f"worktree {expected.as_posix()}\n") == 1
+    assert f"worktree {expected.as_posix()}/.worktrees/{tid}" not in listed
     assert f"branch refs/heads/{actual_branch}" in listed
 
 
@@ -3449,6 +3664,7 @@ def test_resolve_hermes_argv_prefers_path_shim(monkeypatch):
     import hermes_cli.kanban_db as kb
 
     monkeypatch.delenv("HERMES_BIN", raising=False)
+    monkeypatch.setattr(kb, "_IS_WINDOWS", False)
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/hermes")
     argv = kb._resolve_hermes_argv()
     assert argv == ["/usr/local/bin/hermes"]
@@ -3510,6 +3726,7 @@ def test_resolve_hermes_argv_hermes_bin_bare_name_uses_path(monkeypatch, tmp_pat
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PATH", str(path_hermes.parent))
     monkeypatch.setenv("HERMES_BIN", "hermes")
+    monkeypatch.setattr(kb, "_IS_WINDOWS", False)
 
     assert kb._resolve_hermes_argv() == [str(path_hermes)]
 
@@ -3568,6 +3785,7 @@ def test_resolve_hermes_argv_falls_back_to_module_form_when_no_path_shim(monkeyp
     import hermes_cli.kanban_db as kb
 
     monkeypatch.delenv("HERMES_BIN", raising=False)
+    monkeypatch.setattr(kb, "_IS_WINDOWS", False)
     monkeypatch.setattr(shutil, "which", lambda name: None)
     argv = kb._resolve_hermes_argv()
     assert argv == [sys.executable, "-m", "hermes_cli.main"]
@@ -3841,6 +4059,40 @@ def test_dispatch_max_in_progress_spawns_up_to_cap(kanban_home, all_assignees_sp
     assert len(spawns) == 2, f"expected 2 spawns (cap 3 - 1 running), got {len(spawns)}"
 
 
+def test_dispatch_combined_caps_fill_remaining_capacity(
+    kanban_home, all_assignees_spawnable
+):
+    """Equal max_spawn/max_in_progress caps must fill, not subtract twice."""
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(task.id)
+
+    with kb.connect() as conn:
+        for index, assignee in enumerate(("alice", "bob", "carol")):
+            running = kb.create_task(
+                conn, title=f"running-{index}", assignee=assignee
+            )
+            kb.claim_task(conn, running)
+        ready_a = kb.create_task(conn, title="ready-a", assignee="alice")
+        ready_b = kb.create_task(conn, title="ready-b", assignee="bob")
+        ready_c = kb.create_task(conn, title="ready-c", assignee="carol")
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            max_spawn=5,
+            max_in_progress=5,
+        )
+
+        assert spawns == [ready_a, ready_b]
+        assert [task_id for task_id, _assignee, _workspace in result.spawned] == [
+            ready_a,
+            ready_b,
+        ]
+        assert kb.get_task(conn, ready_c).status == "ready"
+
+
 def test_dispatch_max_in_progress_none_is_unlimited(kanban_home, all_assignees_spawnable):
     """Default None means no limit — all ready tasks are spawned."""
     spawns = []
@@ -3925,6 +4177,119 @@ def test_dispatch_review_spawns_with_correct_skills(
     assert len(res.spawned) == 1
     assert len(spawned_tasks) == 1
     assert spawned_tasks[0].skills == ["sdlc-review"]
+
+
+def test_dispatch_applies_default_max_runtime_to_ready_task(
+    kanban_home, all_assignees_spawnable,
+):
+    spawned_tasks = []
+
+    def capture_spawn(task, workspace, board=None):
+        spawned_tasks.append(task)
+        return 42
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="bounded", assignee="alice")
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=capture_spawn,
+            default_max_runtime_seconds=123,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert len(res.spawned) == 1
+    assert spawned_tasks[0].max_runtime_seconds == 123
+    assert task.max_runtime_seconds == 123
+
+
+def test_dispatch_preserves_explicit_max_runtime(
+    kanban_home, all_assignees_spawnable,
+):
+    spawned_tasks = []
+
+    def capture_spawn(task, workspace, board=None):
+        spawned_tasks.append(task)
+        return 42
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="already bounded",
+            assignee="alice",
+            max_runtime_seconds=456,
+        )
+        kb.dispatch_once(
+            conn,
+            spawn_fn=capture_spawn,
+            default_max_runtime_seconds=123,
+        )
+        task = kb.get_task(conn, tid)
+
+    assert spawned_tasks[0].max_runtime_seconds == 456
+    assert task.max_runtime_seconds == 456
+
+
+def test_dispatch_preflights_missing_worker_skill(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    def fail_spawn(task, workspace, board=None):
+        raise AssertionError("spawn should not be called when skill preflight fails")
+
+    monkeypatch.setattr(
+        kb,
+        "_known_skill_names_for_profile",
+        lambda profile: {"known-skill"},
+    )
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="needs missing skill",
+            assignee="alice",
+            skills=["missing-skill"],
+        )
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=fail_spawn,
+            failure_limit=1,
+        )
+        second = kb.dispatch_once(
+            conn,
+            spawn_fn=fail_spawn,
+            failure_limit=1,
+        )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+
+    assert res.spawned == []
+    assert second.spawned == []
+    assert tid in res.auto_blocked
+    assert task.status == "blocked"
+    assert task.consecutive_failures == 1
+    assert "missing worker skill" in (task.last_failure_error or "")
+    assert sum(e.kind == "skill_preflight_failed" for e in events) == 1
+    assert sum(e.kind == "gave_up" for e in events) == 1
+
+
+def test_missing_worker_skills_includes_external_roots_and_allows_qualified_names(
+    kanban_home, monkeypatch, tmp_path,
+):
+    external = tmp_path / "external-skills"
+    skill_dir = external / "vendor-skill"
+    skill_dir.mkdir(parents=True)
+    skill_dir.joinpath("SKILL.md").write_text(
+        "---\nname: vendor-skill\n---\n# Vendor skill\n",
+        encoding="utf-8",
+    )
+
+    import agent.skill_utils as skill_utils
+    import hermes_cli.profiles as profiles
+
+    monkeypatch.setattr(skill_utils, "get_external_skills_dirs", lambda: [external])
+    monkeypatch.setattr(profiles, "resolve_profile_env", lambda _profile: kanban_home)
+
+    assert kb.missing_worker_skills("alice", ["vendor-skill"]) == []
+    assert kb.missing_worker_skills("alice", ["plugin:opaque-skill"]) == []
 
 
 def test_dispatch_review_skips_unassigned(kanban_home):
@@ -4749,10 +5114,17 @@ def test_write_txn_check_reads_correct_header_fields(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_reap_worker_zombies_returns_count():
+def _force_posix_waitpid(monkeypatch):
+    """Let waitpid tests exercise the POSIX branch even on Windows hosts."""
+    monkeypatch.setattr("hermes_cli.kanban_db.os.name", "posix")
+    monkeypatch.setattr("hermes_cli.kanban_db.os.WNOHANG", 1, raising=False)
+
+
+def test_reap_worker_zombies_returns_count(monkeypatch):
     """reap_worker_zombies() returns the list of reaped PIDs."""
     from unittest.mock import patch
 
+    _force_posix_waitpid(monkeypatch)
     fake_pids = [12345, 67890, 11111]
     call_count = [0]
 
@@ -4789,10 +5161,11 @@ def test_reap_worker_zombies_noop_no_children():
     assert result == []
 
 
-def test_reap_worker_zombies_records_exit_status():
+def test_reap_worker_zombies_records_exit_status(monkeypatch):
     """reap_worker_zombies() calls _record_worker_exit for each reaped pid."""
     from unittest.mock import patch
 
+    _force_posix_waitpid(monkeypatch)
     calls = []
     call_count = [0]
 
@@ -4821,10 +5194,11 @@ def test_reap_worker_zombies_handles_waitpid_os_error():
     assert result == []
 
 
-def test_zombie_reaper_runs_despite_board_connect_failure():
+def test_zombie_reaper_runs_despite_board_connect_failure(monkeypatch):
     """reap_worker_zombies runs even when a board tick raises an error."""
     from unittest.mock import patch
 
+    _force_posix_waitpid(monkeypatch)
     call_count = [0]
 
     def fake_waitpid(pid, flags):
@@ -4847,10 +5221,11 @@ def test_zombie_reaper_runs_despite_board_connect_failure():
     assert pids == [12345, 67890]
 
 
-def test_zombie_reaper_survives_all_boards_failing():
+def test_zombie_reaper_survives_all_boards_failing(monkeypatch):
     """reap_worker_zombies runs each tick regardless of board tick failures."""
     from unittest.mock import patch
 
+    _force_posix_waitpid(monkeypatch)
     total_reaped = 0
 
     def make_fake_waitpid(zombie_pids):
@@ -4893,7 +5268,8 @@ def test_dispatch_once_still_reaps_via_extracted_fn(kanban_home):
     with patch("hermes_cli.kanban_db.os.waitpid", side_effect=fake_waitpid):
         with patch("hermes_cli.kanban_db._record_worker_exit"):
             with patch("hermes_cli.kanban_db.os.name", "posix"):
-                pids = kb.reap_worker_zombies()
+                with patch("hermes_cli.kanban_db.os.WNOHANG", 1, create=True):
+                    pids = kb.reap_worker_zombies()
 
     assert pids == [99999]
 

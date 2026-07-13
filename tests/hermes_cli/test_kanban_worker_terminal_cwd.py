@@ -99,3 +99,107 @@ def test_terminal_cwd_not_pinned_for_nonexistent_workspace(monkeypatch, tmp_path
 
     # Inherited value is preserved (not overwritten with a bogus path).
     assert captured["env"]["TERMINAL_CWD"] == "/pre/existing/anchor"
+
+
+def test_default_spawn_propagates_task_notification_origin(monkeypatch, tmp_path):
+    """Child cards created by a worker inherit the parent task's notifier."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "w"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "stale")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "wrong")
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFIER_PROFILE", "wrong-owner")
+
+    from hermes_cli import kanban_db as kb
+
+    kb.init_db()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="parent",
+            assignee="w",
+            session_id="session-parent",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="haru-chat",
+            thread_id="haru-thread",
+            user_id="haru-user",
+            notifier_profile="kurumi",
+        )
+        task = kb.get_task(conn, tid)
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4242
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["env"] = dict(kwargs.get("env") or {})
+        captured["cmd"] = list(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    kb._default_spawn(task, str(workspace))
+
+    env = captured["env"]
+    assert env["HERMES_SESSION_ID"] == "session-parent"
+    assert env["HERMES_SESSION_PLATFORM"] == "telegram"
+    assert env["HERMES_SESSION_CHAT_ID"] == "haru-chat"
+    assert env["HERMES_SESSION_THREAD_ID"] == "haru-thread"
+    assert env["HERMES_SESSION_USER_ID"] == "haru-user"
+    assert env["HERMES_KANBAN_NOTIFIER_PROFILE"] == "kurumi"
+
+
+def test_default_spawn_clears_stale_session_env_without_subscription(monkeypatch, tmp_path):
+    """A worker with no subscription must not inherit stale gateway routing."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "w"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    root.joinpath("config.yaml").write_text("toolsets:\n  - kanban\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "stale-chat")
+    monkeypatch.setenv("HERMES_SESSION_ID", "stale-session")
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "stale-profile")
+    monkeypatch.setenv("HERMES_KANBAN_NOTIFIER_PROFILE", "stale-owner")
+
+    from hermes_cli import kanban_db as kb
+
+    kb.init_db()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="parent", assignee="w")
+        task = kb.get_task(conn, tid)
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4242
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["env"] = dict(kwargs.get("env") or {})
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    kb._default_spawn(task, str(workspace))
+
+    env = captured["env"]
+    assert "HERMES_SESSION_PLATFORM" not in env
+    assert "HERMES_SESSION_CHAT_ID" not in env
+    assert "HERMES_SESSION_ID" not in env
+    assert "HERMES_SESSION_PROFILE" not in env
+    assert "HERMES_KANBAN_NOTIFIER_PROFILE" not in env

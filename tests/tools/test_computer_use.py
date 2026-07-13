@@ -17,13 +17,16 @@ import pytest
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
-def _reset_backend():
+def _reset_backend(tmp_path, monkeypatch):
     """Tear down the cached backend between tests."""
     from tools.computer_use.tool import reset_backend_for_tests
     reset_backend_for_tests()
-    # Force the noop backend.
-    with patch.dict(os.environ, {"HERMES_COMPUTER_USE_BACKEND": "noop"}, clear=False):
-        yield
+    # Force the noop backend and isolate the shared desktop lock from the
+    # user's real Hermes profile state.
+    monkeypatch.setenv("HERMES_COMPUTER_USE_BACKEND", "noop")
+    monkeypatch.setenv("HERMES_DESKTOP_LOCK_DIR", str(tmp_path / "desktop-locks"))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profiles" / "test-profile"))
+    yield
     reset_backend_for_tests()
 
 
@@ -68,9 +71,21 @@ class TestSchema:
         from tools.computer_use.schema import COMPUTER_USE_SCHEMA
         actions = set(COMPUTER_USE_SCHEMA["parameters"]["properties"]["action"]["enum"])
         assert actions >= {
+            "desktop_lock_status", "acquire_desktop_lock", "release_desktop_lock",
             "capture", "click", "double_click", "right_click", "middle_click",
             "drag", "scroll", "type", "key", "wait", "list_apps", "focus_app",
+            "set_value",
         }
+
+    def test_schema_exposes_desktop_lock_fields(self):
+        from tools.computer_use.schema import COMPUTER_USE_SCHEMA
+        props = COMPUTER_USE_SCHEMA["parameters"]["properties"]
+        assert "purpose" in props
+        assert "ttl_seconds" in props
+        assert props["purpose"]["type"] == "string"
+        assert props["ttl_seconds"]["type"] == "integer"
+        assert props["ttl_seconds"]["minimum"] == 30
+        assert props["ttl_seconds"]["maximum"] == 900
 
     def test_capture_mode_enum_has_som_vision_ax(self):
         from tools.computer_use.schema import COMPUTER_USE_SCHEMA
@@ -298,6 +313,152 @@ class TestDispatch:
         # Noop backend returns ok=True, so capture should have been called.
         capture_calls = [c for c in noop_backend.calls if c[0] == "capture"]
         assert len(capture_calls) == 1
+
+    def test_desktop_lock_status_starts_unlocked(self):
+        from tools.computer_use.tool import handle_computer_use
+        out = handle_computer_use({"action": "desktop_lock_status"})
+        parsed = json.loads(out)
+        assert parsed["locked"] is False
+        assert "path" in parsed
+
+    def test_desktop_lock_blocks_other_profile_mutations(self, monkeypatch, noop_backend):
+        from tools.computer_use.tool import handle_computer_use
+
+        monkeypatch.setenv("HERMES_HOME", r"C:\profiles\kurumi")
+        acquired = json.loads(handle_computer_use({
+            "action": "acquire_desktop_lock",
+            "purpose": "HOI4 campaign control",
+        }))
+        assert acquired["locked"] is True
+        assert acquired["owner"] == "kurumi"
+
+        monkeypatch.setenv("HERMES_HOME", r"C:\profiles\asuna")
+        blocked_acquire = json.loads(handle_computer_use({
+            "action": "acquire_desktop_lock",
+            "purpose": "Blender QA",
+        }))
+        assert blocked_acquire["error"] == "desktop control is locked by another profile"
+        assert blocked_acquire["owner"] == "kurumi"
+        assert blocked_acquire["purpose"] == "HOI4 campaign control"
+
+        blocked_key = json.loads(handle_computer_use({
+            "action": "key",
+            "keys": "ctrl+s",
+        }))
+        assert blocked_key["error"] == "desktop control is locked by another profile"
+        assert not any(c[0] == "key" for c in noop_backend.calls)
+
+    def test_desktop_lock_release_requires_owner(self, monkeypatch):
+        from tools.computer_use.tool import handle_computer_use
+
+        monkeypatch.setenv("HERMES_HOME", r"C:\profiles\kurumi")
+        acquired = json.loads(handle_computer_use({
+            "action": "acquire_desktop_lock",
+            "purpose": "desktop task",
+        }))
+        assert acquired["owner"] == "kurumi"
+
+        monkeypatch.setenv("HERMES_HOME", r"C:\profiles\kairi")
+        denied = json.loads(handle_computer_use({"action": "release_desktop_lock"}))
+        assert denied["error"] == "desktop control lock belongs to another profile"
+        assert denied["owner"] == "kurumi"
+
+        monkeypatch.setenv("HERMES_HOME", r"C:\profiles\kurumi")
+        released = json.loads(handle_computer_use({"action": "release_desktop_lock"}))
+        assert released["released"] is True
+        assert released["owner"] == "kurumi"
+
+        status = json.loads(handle_computer_use({"action": "desktop_lock_status"}))
+        assert status["locked"] is False
+
+    def test_desktop_lock_distinguishes_same_profile_workers(self, monkeypatch):
+        import tools.computer_use.tool as computer_tool
+
+        monkeypatch.setenv("HERMES_HOME", r"C:\profiles\kurumi")
+        monkeypatch.setattr(computer_tool, "_DESKTOP_LOCK_TOKEN", "worker-a")
+        acquired = computer_tool._acquire_desktop_lock({"purpose": "Unreal editor"})
+        assert acquired[0] is True
+
+        monkeypatch.setattr(computer_tool, "_DESKTOP_LOCK_TOKEN", "worker-b")
+        blocked = computer_tool._acquire_desktop_lock({"purpose": "Blender"})
+        assert blocked[0] is False
+        assert "another worker for this profile" in blocked[1]["error"]
+        denied_release = computer_tool._release_desktop_lock()
+        assert "another worker for this profile" in denied_release["error"]
+
+        monkeypatch.setattr(computer_tool, "_DESKTOP_LOCK_TOKEN", "worker-a")
+        assert computer_tool._release_desktop_lock()["released"] is True
+
+    def test_mutating_action_refreshes_same_profile_lock(self, monkeypatch, noop_backend):
+        from tools.computer_use.tool import handle_computer_use
+
+        monkeypatch.setenv("HERMES_HOME", r"C:\profiles\asuna")
+        first = json.loads(handle_computer_use({
+            "action": "acquire_desktop_lock",
+            "purpose": "ui setup",
+            "ttl_seconds": 30,
+        }))
+        assert first["owner"] == "asuna"
+
+        out = handle_computer_use({"action": "click", "element": 4})
+        parsed = json.loads(out)
+        assert parsed.get("ok") is True
+        assert any(c[0] == "click" for c in noop_backend.calls)
+
+        status = json.loads(handle_computer_use({"action": "desktop_lock_status"}))
+        assert status["locked"] is True
+        assert status["owner"] == "asuna"
+
+    def test_auto_approve_config_bypasses_mutating_action_prompt(self, noop_backend):
+        from tools.computer_use.tool import handle_computer_use, set_approval_callback
+
+        def deny(_action, _args, _summary):
+            return "deny"
+
+        try:
+            with patch("hermes_cli.config.load_config",
+                       return_value={"computer_use": {"auto_approve": True}}):
+                set_approval_callback(deny)
+                out = handle_computer_use({"action": "click", "element": 4})
+        finally:
+            set_approval_callback(None)
+
+        parsed = json.loads(out)
+        assert parsed.get("ok") is True
+        assert parsed.get("action") == "click"
+        assert any(c[0] == "click" for c in noop_backend.calls)
+
+    def test_auto_approve_config_keeps_hard_key_blocks(self, noop_backend):
+        from tools.computer_use.tool import handle_computer_use, set_approval_callback
+
+        try:
+            with patch("hermes_cli.config.load_config",
+                       return_value={"computer_use": {"auto_approve": True}}):
+                set_approval_callback(lambda *_args: "approve_session")
+                out = handle_computer_use({"action": "key", "keys": "win+l"})
+        finally:
+            set_approval_callback(None)
+
+        parsed = json.loads(out)
+        assert "blocked key combo" in parsed["error"]
+        assert not any(c[0] == "key" for c in noop_backend.calls)
+
+    def test_auto_approve_string_false_does_not_bypass_prompt(self, noop_backend):
+        from tools.computer_use.tool import handle_computer_use, set_approval_callback
+
+        try:
+            with patch(
+                "hermes_cli.config.load_config",
+                return_value={"computer_use": {"auto_approve": "false"}},
+            ):
+                set_approval_callback(lambda *_args: "deny")
+                out = handle_computer_use({"action": "click", "element": 4})
+        finally:
+            set_approval_callback(None)
+
+        parsed = json.loads(out)
+        assert parsed.get("error") == "denied by user"
+        assert not any(c[0] == "click" for c in noop_backend.calls)
 
 
 # ---------------------------------------------------------------------------

@@ -55,6 +55,27 @@ class TestMarkerContract:
         # idempotent: clearing again is a no-op, returns False
         assert dc.clear_drain_request() is False
 
+    def test_conditional_clear_removes_only_owned_marker(self, home):
+        dc.write_drain_request(principal="idle-restart:one")
+        assert dc.clear_drain_request(expected_principal="idle-restart:other") is False
+        assert dc.read_drain_request()["principal"] == "idle-restart:one"
+        assert dc.clear_drain_request(expected_principal="idle-restart:one") is True
+        assert dc.read_drain_request() is None
+
+    def test_new_writer_cannot_be_erased_by_stale_owner_cleanup(self, home):
+        dc.write_drain_request(principal="idle-restart:old")
+        dc.write_drain_request(principal="dashboard:new")
+        assert dc.clear_drain_request(expected_principal="idle-restart:old") is False
+        assert dc.read_drain_request()["principal"] == "dashboard:new"
+
+    def test_exclusive_claim_does_not_overwrite_existing_operator_drain(self, home):
+        dc.write_drain_request(principal="dashboard:existing")
+        with pytest.raises(FileExistsError):
+            dc.write_drain_request(
+                principal="idle-restart:new", require_absent=True
+            )
+        assert dc.read_drain_request()["principal"] == "dashboard:existing"
+
     def test_path_respects_hermes_home(self, home):
         assert dc.drain_request_path() == home / ".drain_request.json"
 

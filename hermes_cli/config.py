@@ -1857,6 +1857,7 @@ DEFAULT_CONFIG = {
             "last_lines": 2,
         },
         "interim_assistant_messages": True,  # Gateway: show natural mid-turn assistant status messages
+        "turn_start_ack": False,  # Gateway: send a short receipt before an agent turn starts
         "tool_progress_command": False,  # Enable /verbose command in messaging gateway
         "tool_progress_overrides": {},  # DEPRECATED — use display.platforms instead
         "tool_preview_length": 0,  # Max chars for tool call previews (0 = no limit, show full paths/commands)
@@ -2726,6 +2727,11 @@ DEFAULT_CONFIG = {
         # only if you run the dispatcher as a separate systemd unit or
         # don't want the gateway to spawn workers.
         "dispatch_in_gateway": True,
+        # Deliver task notifications from every profile gateway, independent
+        # of which profile owns the single dispatcher. Subscription rows are
+        # stamped with notifier_profile, and SQLite cursor claims prevent
+        # duplicate delivery across gateway processes.
+        "notifier_in_gateway": True,
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,
@@ -2772,6 +2778,10 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Default runtime cap for dispatcher-spawned kanban workers when the
+        # task did not specify --max-runtime. Prevents accidental open-ended
+        # helper fan-out from burning tokens indefinitely. Set 0 to disable.
+        "worker_default_max_runtime_seconds": 7200,
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
@@ -3280,6 +3290,10 @@ DEFAULT_CONFIG = {
         # every invocation (MCP backend, status, doctor, install). Set true
         # to let cua-driver use its own default (telemetry on).
         "cua_telemetry": False,
+        # When true, Hermes allows mutating computer_use actions such as
+        # click/type/key/focus_app without asking for per-action approval.
+        # Hard safety blocks still apply before this approval bypass.
+        "auto_approve": False,
     },
 
     # Hermes Desktop (Electron app) launch options. These only affect

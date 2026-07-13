@@ -188,8 +188,8 @@ def _arrange_startup_fallback(monkeypatch, tmp_path, running_pids):
     return script_path, calls
 
 
-def test_gateway_cmd_script_uses_pythonw_without_replace_or_start_churn(monkeypatch):
-    """Scheduled Task wrapper should launch pythonw once and avoid replace loops."""
+def test_gateway_cmd_script_detaches_pythonw_without_replace_churn(monkeypatch):
+    """Startup/watchdog wrapper should launch pythonw and then exit."""
     monkeypatch.setattr(
         gateway_windows,
         "_resolve_detached_python",
@@ -206,7 +206,7 @@ def test_gateway_cmd_script_uses_pythonw_without_replace_or_start_churn(monkeypa
     assert "pythonw.exe" in content
     assert "gateway run" in content
     assert "--replace" not in content
-    assert "start \"\"" not in content
+    assert "start \"\" /b" in content
     assert "exit /b 0" in content
 
 
@@ -910,3 +910,57 @@ def test_drain_helper_still_waits_if_marker_write_fails(monkeypatch):
 
     # Returns True because _pid_exists immediately says "gone".
     assert gateway_windows._drain_gateway_pid(pid, drain_timeout=5.0) is True
+
+
+def test_restart_writes_maintenance_marker_while_restarting(monkeypatch, tmp_path):
+    """Manual Windows restart should suppress profile watchdog relaunch races."""
+    marker = tmp_path / "gateway_maintenance.lock"
+    events = []
+
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows, "get_gateway_maintenance_marker_path", lambda: marker)
+    monkeypatch.setattr(gateway_windows.time, "sleep", lambda _seconds: None)
+
+    def fake_stop():
+        events.append(("stop", marker.exists()))
+
+    def fake_wait_absent(timeout_s=30.0, interval_s=0.5):
+        events.append(("wait_absent", marker.exists(), timeout_s))
+        return True
+
+    def fake_start():
+        events.append(("start", marker.exists()))
+
+    monkeypatch.setattr(gateway_windows, "stop", fake_stop)
+    monkeypatch.setattr(gateway_windows, "_wait_for_gateway_absent", fake_wait_absent)
+    monkeypatch.setattr(gateway_windows, "start", fake_start)
+    monkeypatch.setattr(gateway_windows, "_wait_for_gateway_ready", lambda timeout_s=15.0: [12345])
+    monkeypatch.setattr("hermes_cli.gateway.kill_gateway_processes", lambda **_kwargs: 0)
+
+    gateway_windows.restart()
+
+    assert events == [
+        ("stop", True),
+        ("wait_absent", True, 30.0),
+        ("start", True),
+    ]
+    assert not marker.exists()
+
+
+def test_restart_clears_maintenance_marker_on_failure(monkeypatch, tmp_path):
+    """The watchdog pause marker must not survive a failed restart."""
+    marker = tmp_path / "gateway_maintenance.lock"
+
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows, "get_gateway_maintenance_marker_path", lambda: marker)
+    monkeypatch.setattr(gateway_windows.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(gateway_windows, "stop", lambda: None)
+    monkeypatch.setattr(gateway_windows, "_wait_for_gateway_absent", lambda timeout_s=30.0, interval_s=0.5: True)
+    monkeypatch.setattr(gateway_windows, "start", lambda: None)
+    monkeypatch.setattr(gateway_windows, "_wait_for_gateway_ready", lambda timeout_s=15.0: [])
+    monkeypatch.setattr("hermes_cli.gateway.kill_gateway_processes", lambda **_kwargs: 0)
+
+    with pytest.raises(RuntimeError):
+        gateway_windows.restart()
+
+    assert not marker.exists()

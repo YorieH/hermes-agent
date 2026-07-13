@@ -190,6 +190,63 @@ async def test_reconnect_success_resets_error_count():
 
 
 @pytest.mark.asyncio
+async def test_reconnect_persists_retrying_then_connected_runtime_status():
+    """
+    A gateway heartbeat can stay healthy while Telegram polling is reconnecting.
+    Persist retrying/connected platform status so external watchdogs can see the
+    real Telegram state instead of trusting a stale connected marker.
+    """
+    adapter = _make_adapter()
+    adapter._polling_network_error_count = 1
+    adapter._write_runtime_status_safe = MagicMock()
+
+    mock_updater = MagicMock()
+    mock_updater.running = True
+    mock_updater.stop = AsyncMock()
+    mock_updater.start_polling = AsyncMock()
+
+    mock_app = MagicMock()
+    mock_app.updater = mock_updater
+    mock_app.bot.get_me = AsyncMock(return_value=MagicMock())
+    adapter._app = mock_app
+
+    secret = "123456789:AAFakeSecretTelegramBotTokenABCDEFGHIJ"
+    error = Exception(
+        f"temporary DNS failure at https://api.telegram.org/bot{secret}/getUpdates"
+    )
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        await adapter._handle_polling_network_error(error)
+
+    retry_calls = [
+        call for call in adapter._write_runtime_status_safe.call_args_list
+        if call.kwargs.get("platform_state") == "retrying"
+    ]
+    assert retry_calls, "network reconnect must persist retrying platform state"
+    assert retry_calls[-1].kwargs["error_code"] == "telegram_network_error"
+    assert secret not in retry_calls[-1].kwargs["error_message"]
+    assert "***" in retry_calls[-1].kwargs["error_message"]
+
+    # Cancel the scheduled probe, then run the probe deterministically.
+    pending = [t for t in adapter._background_tasks if not t.done()]
+    for t in pending:
+        t.cancel()
+        try:
+            await t
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        await adapter._verify_polling_after_reconnect()
+
+    connected_calls = [
+        call for call in adapter._write_runtime_status_safe.call_args_list
+        if call.kwargs.get("platform_state") == "connected"
+    ]
+    assert connected_calls, "successful heartbeat probe must restore connected state"
+    assert connected_calls[-1].kwargs["error_code"] is None
+
+
+@pytest.mark.asyncio
 async def test_reconnect_triggers_fatal_after_max_retries():
     """
     After MAX_NETWORK_RETRIES attempts, the adapter should set a fatal error
@@ -324,6 +381,38 @@ async def test_conflict_retry_also_drains_polling_connections():
     mock_polling_req.shutdown.assert_called_once()
     mock_polling_req.initialize.assert_called_once()
     mock_app.updater.start_polling.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_conflict_retry_persists_retrying_and_connected_runtime_status():
+    adapter = _make_adapter()
+    adapter._polling_conflict_count = 0
+    adapter._write_runtime_status_safe = MagicMock()
+
+    mock_app, _mock_polling_req = _make_mock_app()
+    adapter._app = mock_app
+
+    secret = "123456789:AAFakeSecretTelegramBotTokenABCDEFGHIJ"
+    error = Exception(
+        "Conflict: terminated by other getUpdates at "
+        f"https://api.telegram.org/bot{secret}/getUpdates"
+    )
+    with patch("asyncio.sleep", new_callable=AsyncMock):
+        await adapter._handle_polling_conflict(error)
+
+    states = [
+        call.kwargs.get("platform_state")
+        for call in adapter._write_runtime_status_safe.call_args_list
+    ]
+    assert "retrying" in states
+    assert "connected" in states
+    retry_call = next(
+        call
+        for call in adapter._write_runtime_status_safe.call_args_list
+        if call.kwargs.get("platform_state") == "retrying"
+    )
+    assert secret not in retry_call.kwargs["error_message"]
+    assert "***" in retry_call.kwargs["error_message"]
 
 
 @pytest.mark.asyncio
@@ -986,4 +1075,3 @@ async def test_handle_polling_network_error_updater_stop_timeout():
     # The reconnect ladder must have advanced past the hung stop().
     assert drain_called, "_drain_polling_connections was not called after stop() timeout"
     assert start_polling_called, "start_polling was not called after stop() timeout"
-

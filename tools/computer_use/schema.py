@@ -33,6 +33,9 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                 "type": "string",
                 "enum": [
                     "capture",
+                    "desktop_lock_status",
+                    "acquire_desktop_lock",
+                    "release_desktop_lock",
                     "click",
                     "double_click",
                     "right_click",
@@ -48,7 +51,9 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                 ],
                 "description": (
                     "Which action to perform. `capture` is free (no side "
-                    "effects). All other actions require approval unless "
+                    "effects). `desktop_lock_status`, `acquire_desktop_lock`, "
+                    "and `release_desktop_lock` coordinate shared desktop "
+                    "ownership across profiles. All other actions require approval unless "
                     "auto-approved. Use `set_value` for select/popup elements "
                     "and sliders — it selects the matching option directly "
                     "without opening the native menu (no focus steal)."
@@ -191,6 +196,24 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
             "seconds": {
                 "type": "number",
                 "description": "Seconds to wait. Max 30.",
+            },
+            "purpose": {
+                "type": "string",
+                "description": (
+                    "Optional reason for action='acquire_desktop_lock'. "
+                    "Use a short task name such as 'HOI4 control' or "
+                    "'Blender render QA'."
+                ),
+            },
+            "ttl_seconds": {
+                "type": "integer",
+                "description": (
+                    "Optional lease duration for action='acquire_desktop_lock'. "
+                    "Default is 180 seconds; each mutating desktop action "
+                    "from the same profile refreshes the lease."
+                ),
+                "minimum": 30,
+                "maximum": 900,
             },
             # ── focus_app ──────────────────────────────────────────
             "raise_window": {

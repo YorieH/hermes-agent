@@ -52,9 +52,11 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
@@ -62,6 +64,7 @@ from utils import atomic_json_write
 _log = logging.getLogger(__name__)
 
 _DRAIN_REQUEST_FILENAME = ".drain_request.json"
+_DRAIN_LOCK_FILENAME = ".drain_request.lock"
 
 
 @functools.lru_cache(maxsize=1)
@@ -132,11 +135,51 @@ def drain_request_path(home: Optional[Path] = None) -> Path:
     return Path(base) / _DRAIN_REQUEST_FILENAME
 
 
+def drain_request_lock_path(home: Optional[Path] = None) -> Path:
+    """Cross-process lock serializing marker ownership changes."""
+    base = home if home is not None else get_hermes_home()
+    return Path(base) / _DRAIN_LOCK_FILENAME
+
+
+@contextmanager
+def _drain_marker_lock(
+    *, home: Optional[Path] = None, timeout: float = 2.0
+) -> Iterator[None]:
+    """Serialize write/conditional-clear across dashboard and helper processes.
+
+    The gateway runtime lock helpers already implement the platform-specific
+    ``fcntl``/``msvcrt`` details.  The lock file is durable metadata; the OS
+    releases ownership if a process exits, so no stale-PID deletion heuristic
+    is needed.
+    """
+    from gateway.status import _release_file_lock, _try_acquire_file_lock
+
+    path = drain_request_lock_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+", encoding="utf-8")
+    acquired = False
+    deadline = time.monotonic() + max(0.05, float(timeout))
+    try:
+        while time.monotonic() < deadline:
+            if _try_acquire_file_lock(handle):
+                acquired = True
+                break
+            time.sleep(0.025)
+        if not acquired:
+            raise TimeoutError(f"timed out acquiring drain marker lock: {path}")
+        yield
+    finally:
+        if acquired:
+            _release_file_lock(handle)
+        handle.close()
+
+
 def write_drain_request(
     *,
     principal: str = "drain-control",
     suppress_notification: bool = False,
     home: Optional[Path] = None,
+    require_absent: bool = False,
 ) -> dict[str, Any]:
     """Write the begin-drain marker. Returns the payload written.
 
@@ -166,19 +209,36 @@ def write_drain_request(
         "epoch": current_instantiation_epoch(),
         "suppress_notification": bool(suppress_notification),
     }
-    atomic_json_write(drain_request_path(home), payload)
+    path = drain_request_path(home)
+    with _drain_marker_lock(home=home):
+        if require_absent and path.exists():
+            raise FileExistsError(f"a drain request already exists: {path}")
+        atomic_json_write(path, payload)
     return payload
 
 
-def clear_drain_request(*, home: Optional[Path] = None) -> bool:
+def clear_drain_request(
+    *, home: Optional[Path] = None, expected_principal: Optional[str] = None
+) -> bool:
     """Remove the drain marker (cancel-drain). Returns True if one existed.
 
-    Best-effort: a missing file is not an error (cancel is idempotent).
+    When ``expected_principal`` is supplied, removal is conditional on the
+    current marker still belonging to that principal.  The comparison and
+    unlink share the same cross-process lock as writers, so a helper's cleanup
+    can never erase a newer dashboard/operator drain.
+
+    Best-effort: a missing file or ownership mismatch is not an error (cancel
+    is idempotent). Lock/read/unlink failures remain visible as warnings.
     """
     path = drain_request_path(home)
     try:
-        path.unlink()
-        return True
+        with _drain_marker_lock(home=home):
+            if expected_principal is not None:
+                body = _read_drain_request_unlocked(path)
+                if body is None or body.get("principal") != expected_principal:
+                    return False
+            path.unlink()
+            return True
     except FileNotFoundError:
         return False
     except OSError as e:
@@ -251,6 +311,16 @@ def drain_notification_suppressed(*, home: Optional[Path] = None) -> bool:
     return bool(body.get("suppress_notification"))
 
 
+def _read_drain_request_unlocked(path: Path) -> Optional[dict[str, Any]]:
+    """Read one marker while the caller owns the marker lock."""
+    raw = path.read_text(encoding="utf-8")
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def read_drain_request(*, home: Optional[Path] = None) -> Optional[dict[str, Any]]:
     """Return the marker payload, or ``None`` if absent.
 
@@ -260,14 +330,15 @@ def read_drain_request(*, home: Optional[Path] = None) -> Optional[dict[str, Any
     """
     path = drain_request_path(home)
     try:
-        raw = path.read_text(encoding="utf-8")
+        with _drain_marker_lock(home=home):
+            return _read_drain_request_unlocked(path)
     except FileNotFoundError:
         return None
+    except TimeoutError as e:
+        # A writer owns the lock. Preserve the established fail-safe semantics:
+        # if a marker is visible, treat it as present/contentless for this tick.
+        _log.warning("drain-control: %s", e)
+        return {} if path.exists() else None
     except OSError as e:
         _log.warning("drain-control: failed to read %s: %s", path, e)
         return None
-    try:
-        data = json.loads(raw)
-    except (ValueError, TypeError):
-        return {}
-    return data if isinstance(data, dict) else {}

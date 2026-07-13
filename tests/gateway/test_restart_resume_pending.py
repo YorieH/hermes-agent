@@ -165,9 +165,10 @@ def _simulate_note_injection(
                 "on what the user is asking now."
             )
         else:
-            resume_guidance = (
-                "Report to the user that the session was restored "
-                "successfully and ask what they would like to do next."
+            return (
+                "Gateway restored the previous session. I paused before "
+                "doing anything else; send the next instruction when you "
+                "want me to continue."
             )
         message = (
             f"[System note: The previous turn was interrupted by "
@@ -475,6 +476,41 @@ class TestSuspendRecentlyActiveSkipsResumePending:
         assert store._entries[entry_a.session_key].suspended is False
         assert store._entries[entry_b.session_key].resume_pending is True
         assert store._entries[entry_b.session_key].suspended is False
+
+    def test_unused_fresh_reset_is_not_marked_resumable(self, tmp_path):
+        """A crash right after /new must not resurrect the abandoned session."""
+        store = _make_store(tmp_path)
+        source = _make_source()
+        first = store.get_or_create_session(source)
+        fresh = store.reset_session(first.session_key)
+
+        assert fresh is not None
+        assert fresh.is_fresh_reset is True
+
+        count = store.suspend_recently_active()
+
+        assert count == 0
+        entry = store._entries[first.session_key]
+        assert entry.resume_pending is False
+        assert entry.resume_reason is None
+
+    def test_consumed_fresh_reset_can_be_marked_resumable(self, tmp_path):
+        """Once the first post-/new turn starts, crash recovery may resume it."""
+        store = _make_store(tmp_path)
+        source = _make_source()
+        first = store.get_or_create_session(source)
+        fresh = store.reset_session(first.session_key)
+
+        assert fresh is not None
+        assert store.consume_fresh_reset(first.session_key) is True
+
+        count = store.suspend_recently_active()
+
+        assert count == 1
+        entry = store._entries[first.session_key]
+        assert entry.is_fresh_reset is False
+        assert entry.resume_pending is True
+        assert entry.resume_reason == "restart_interrupted"
 
 
 # ---------------------------------------------------------------------------
@@ -803,8 +839,8 @@ class TestResumePendingSystemNote:
 
     def test_resume_pending_empty_message_reports_recovery(self):
         """On the empty-message auto-resume startup turn there is no NEW user
-        message, so the note instructs the model to report recovery and ask
-        for instructions rather than 'address the user's NEW message'.
+        message, so recovery is handled without asking the model to inspect
+        or continue a stale tool-heavy history.
         """
         entry = self._pending_entry(reason="restart_timeout")
         result = _simulate_note_injection(
@@ -814,15 +850,10 @@ class TestResumePendingSystemNote:
             user_message="",
             resume_entry=entry,
         )
-        assert "[System note:" in result
-        assert "gateway restart" in result
-        assert "restored successfully" in result
-        assert "ask what they would like to do next" in result
-        assert "do NOT re-execute or verify" in result
-        # No phantom "NEW message" instruction when there is no new message.
+        assert result.startswith("Gateway restored the previous session.")
+        assert "paused before doing anything else" in result
+        assert "[System note:" not in result
         assert "NEW message" not in result
-        # Nothing appended after the closing bracket (no empty user text).
-        assert result.rstrip().endswith("]")
 
 
 # ---------------------------------------------------------------------------

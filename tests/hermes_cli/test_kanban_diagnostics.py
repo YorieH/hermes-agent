@@ -325,6 +325,39 @@ def test_stuck_in_blocked_silent_when_not_blocked():
     assert kd.compute_task_diagnostics(task, events, [], now=9999999) == []
 
 
+def test_block_unblock_cycling_counts_repeated_reason_only():
+    task = _task(status="running")
+    events = [
+        _event("blocked", ts=100, reason="review-required: same wall"),
+        _event("unblocked", ts=110),
+        _event("blocked", ts=120, reason="review-required: same wall"),
+        _event("unblocked", ts=130),
+        _event("blocked", ts=140, reason="review-required: same wall"),
+        _event("unblocked", ts=150),
+        _event("blocked", ts=160, reason="review-required: same wall"),
+    ]
+    diags = kd.compute_task_diagnostics(task, events, [], now=200)
+    cycling = [d for d in diags if d.kind == "block_unblock_cycling"]
+    assert len(cycling) == 1
+    assert cycling[0].data["cycles"] == 3
+    assert cycling[0].data["repeated_reason"] == "review-required: same wall"
+
+
+def test_block_unblock_cycling_ignores_distinct_review_checkpoints():
+    task = _task(status="running")
+    events = [
+        _event("blocked", ts=100, reason="review-required: slice A proof"),
+        _event("unblocked", ts=110),
+        _event("blocked", ts=120, reason="review-required: slice B proof"),
+        _event("unblocked", ts=130),
+        _event("blocked", ts=140, reason="review-required: slice C proof"),
+        _event("unblocked", ts=150),
+        _event("blocked", ts=160, reason="review-required: slice D proof"),
+    ]
+    diags = kd.compute_task_diagnostics(task, events, [], now=200)
+    assert [d.kind for d in diags if d.kind == "block_unblock_cycling"] == []
+
+
 def test_repeated_crashes_surfaces_actual_error_in_title():
     """The title should lead with the actual error text so operators
     see WHAT broke (e.g. rate-limit, auth, OOM) without opening logs.

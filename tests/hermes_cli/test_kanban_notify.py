@@ -1,8 +1,11 @@
 import asyncio
+import json
+import re
 import pytest
 
 from pathlib import Path
 from types import SimpleNamespace
+from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -218,7 +221,10 @@ async def test_notifier_second_blocked_delivers(kanban_home):
             timeout=10.0,
         )
 
-    blocked_deliveries = [m for m in delivered_msgs if "blocked" in m]
+    blocked_deliveries = [
+        m for m in delivered_msgs
+        if " blocked" in m and "unblocked" not in m
+    ]
     assert "second block" not in blocked_deliveries[0]
     assert "second block" in blocked_deliveries[1]
     assert len(blocked_deliveries) == 2, (
@@ -487,6 +493,366 @@ async def test_gateway_create_autosubscribes_on_explicit_board(kanban_home):
         assert kb.list_notify_subs(conn) == []
     finally:
         conn.close()
+
+
+def test_cli_create_autosubscribes_from_session_env(kanban_home, monkeypatch):
+    """Agent shell calls to `hermes kanban create` should notify Telegram too."""
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat1")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "thread1")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "user1")
+    monkeypatch.setenv("HERMES_SESSION_ID", "session-1")
+    monkeypatch.setenv("HERMES_PROFILE", "kairi")
+
+    out = kc.run_slash('create "notify shell caller" --assignee kairi')
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, tid)
+        task = kb.get_task(conn, tid)
+    finally:
+        conn.close()
+
+    assert task.session_id == "session-1"
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "chat1"
+    assert subs[0]["thread_id"] == "thread1"
+    assert subs[0]["user_id"] == "user1"
+    assert subs[0]["notifier_profile"] == "kairi"
+
+
+def test_cli_create_autosubscribe_preserves_json_output(kanban_home, monkeypatch):
+    """Auto-subscribe must not add text to machine-readable create output."""
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat1")
+    monkeypatch.setenv("HERMES_PROFILE", "kairi")
+
+    payload = json.loads(
+        kc.run_slash('create "json notify" --assignee kairi --json')
+    )
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, payload["id"])
+    finally:
+        conn.close()
+
+    assert payload["title"] == "json notify"
+    assert len(subs) == 1
+    assert subs[0]["chat_id"] == "chat1"
+
+
+def test_autosubscribe_inherits_parent_subscription_without_session_env(
+    kanban_home, monkeypatch,
+):
+    """Child tasks spawned by workers should notify the parent's chat."""
+    for name in (
+        "HERMES_SESSION_PLATFORM",
+        "HERMES_SESSION_CHAT_ID",
+        "HERMES_SESSION_THREAD_ID",
+        "HERMES_SESSION_USER_ID",
+        "HERMES_SESSION_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    from hermes_cli.kanban_notify import maybe_auto_subscribe_task
+
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="parent", assignee="kairi")
+        kb.add_notify_sub(
+            conn,
+            task_id=parent,
+            platform="telegram",
+            chat_id="chat1",
+            thread_id="thread1",
+            user_id="user1",
+            notifier_profile="kairi",
+        )
+        child = kb.create_task(
+            conn,
+            title="child",
+            assignee="asuna",
+            parents=(parent,),
+            session_id="worker-session",
+        )
+
+        assert maybe_auto_subscribe_task(
+            conn, child, notifier_profile="kairi"
+        )
+        subs = kb.list_notify_subs(conn, child)
+    finally:
+        conn.close()
+
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "chat1"
+    assert subs[0]["thread_id"] == "thread1"
+    assert subs[0]["user_id"] == "user1"
+    assert subs[0]["notifier_profile"] == "kairi"
+
+
+def test_autosubscribe_inherits_parent_session_peer_without_session_env(
+    kanban_home, monkeypatch,
+):
+    """If the parent missed a sub, inherit from another task in its session."""
+    for name in (
+        "HERMES_SESSION_PLATFORM",
+        "HERMES_SESSION_CHAT_ID",
+        "HERMES_SESSION_THREAD_ID",
+        "HERMES_SESSION_USER_ID",
+        "HERMES_SESSION_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    from hermes_cli.kanban_notify import maybe_auto_subscribe_task
+
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(
+            conn,
+            title="coordination parent",
+            assignee="kairi",
+            session_id="telegram-session",
+        )
+        peer = kb.create_task(
+            conn,
+            title="same chat peer",
+            assignee="asuna",
+            session_id="telegram-session",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=peer,
+            platform="telegram",
+            chat_id="chat1",
+            thread_id="thread1",
+            user_id="user1",
+            notifier_profile="kairi",
+        )
+        child = kb.create_task(
+            conn,
+            title="worker child",
+            assignee="kurumi",
+            parents=(parent,),
+            session_id="worker-session",
+        )
+
+        assert maybe_auto_subscribe_task(
+            conn, child, notifier_profile="kairi"
+        )
+        subs = kb.list_notify_subs(conn, child)
+    finally:
+        conn.close()
+
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "telegram"
+    assert subs[0]["chat_id"] == "chat1"
+    assert subs[0]["thread_id"] == "thread1"
+    assert subs[0]["user_id"] == "user1"
+    assert subs[0]["notifier_profile"] == "kairi"
+
+
+def test_autosubscribe_recovers_internal_route_from_recorded_session_id(
+    kanban_home, monkeypatch,
+):
+    """Agent-created root tasks may only retain tasks.session_id.
+
+    The gateway ContextVars are not always present in tool subprocesses, so
+    recover the persistent session key from profiles/*/sessions/sessions.json
+    and create an internal wake subscription for the orchestrator.
+    """
+    for name in (
+        "HERMES_SESSION_PLATFORM",
+        "HERMES_SESSION_CHAT_ID",
+        "HERMES_SESSION_THREAD_ID",
+        "HERMES_SESSION_USER_ID",
+        "HERMES_SESSION_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    session_key = "agent:main:telegram:dm:chat1"
+    session_dir = kanban_home / "profiles" / "kurumi" / "sessions"
+    session_dir.mkdir(parents=True)
+    (session_dir / "sessions.json").write_text(
+        json.dumps(
+            {
+                session_key: {
+                    "session_key": session_key,
+                    "session_id": "sess-kurumi-1",
+                    "origin": {
+                        "platform": "telegram",
+                        "chat_id": "chat1",
+                        "chat_type": "dm",
+                        "user_id": "user1",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    from hermes_cli.kanban_notify import maybe_auto_subscribe_task
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="root helper",
+            assignee="asuna",
+            created_by="kurumi",
+            session_id="sess-kurumi-1",
+        )
+        assert maybe_auto_subscribe_task(conn, tid, notifier_profile="kurumi")
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "tui"
+    assert subs[0]["chat_id"] == session_key
+    assert subs[0]["user_id"] == "user1"
+    assert subs[0]["notifier_profile"] == "kurumi"
+
+
+def test_recorded_session_prefers_valid_route_profile_over_invalid_author(
+    kanban_home, monkeypatch,
+):
+    """OS usernames and invalid explicit owners must not orphan subscriptions."""
+    for name in (
+        "HERMES_SESSION_PLATFORM",
+        "HERMES_SESSION_CHAT_ID",
+        "HERMES_SESSION_THREAD_ID",
+        "HERMES_SESSION_USER_ID",
+        "HERMES_SESSION_KEY",
+        "HERMES_KANBAN_NOTIFIER_PROFILE",
+        "HERMES_PROFILE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    session_key = "agent:main:telegram:dm:chat-route"
+    session_dir = kanban_home / "profiles" / "kurumi" / "sessions"
+    session_dir.mkdir(parents=True)
+    (session_dir / "sessions.json").write_text(
+        json.dumps(
+            {
+                session_key: {
+                    "session_key": session_key,
+                    "session_id": "sess-route-1",
+                    "origin": {
+                        "platform": "telegram",
+                        "chat_id": "chat-route",
+                        "chat_type": "dm",
+                        "user_id": "user-route",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    from hermes_cli.kanban_notify import maybe_auto_subscribe_task
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="route-owned helper",
+            assignee="asuna",
+            created_by="dayvo",
+            session_id="sess-route-1",
+        )
+        assert maybe_auto_subscribe_task(
+            conn,
+            tid,
+            notifier_profile="dayvo",
+        )
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+
+    assert len(subs) == 1
+    assert subs[0]["notifier_profile"] == "kurumi"
+
+
+def test_autosubscribe_recovers_internal_route_from_compacted_ancestor_session(
+    kanban_home, monkeypatch,
+):
+    """Tasks created before compression should still wake the current chat."""
+    for name in (
+        "HERMES_SESSION_PLATFORM",
+        "HERMES_SESSION_CHAT_ID",
+        "HERMES_SESSION_THREAD_ID",
+        "HERMES_SESSION_USER_ID",
+        "HERMES_SESSION_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    session_key = "agent:main:telegram:dm:chat1"
+    profile_root = kanban_home / "profiles" / "kurumi"
+    session_dir = profile_root / "sessions"
+    session_dir.mkdir(parents=True)
+    (session_dir / "sessions.json").write_text(
+        json.dumps(
+            {
+                session_key: {
+                    "session_key": session_key,
+                    "session_id": "sess-kurumi-current",
+                    "origin": {
+                        "platform": "telegram",
+                        "chat_id": "chat1",
+                        "chat_type": "dm",
+                        "user_id": "user1",
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    import sqlite3
+
+    state_db = profile_root / "state.db"
+    conn_state = sqlite3.connect(state_db)
+    try:
+        conn_state.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT)"
+        )
+        conn_state.execute(
+            "INSERT INTO sessions (id, parent_session_id) VALUES (?, ?)",
+            ("sess-kurumi-ancestor", None),
+        )
+        conn_state.execute(
+            "INSERT INTO sessions (id, parent_session_id) VALUES (?, ?)",
+            ("sess-kurumi-current", "sess-kurumi-ancestor"),
+        )
+        conn_state.commit()
+    finally:
+        conn_state.close()
+
+    from hermes_cli.kanban_notify import maybe_auto_subscribe_task
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="root helper from old session",
+            assignee="asuna",
+            created_by="kurumi",
+            session_id="sess-kurumi-ancestor",
+        )
+        assert maybe_auto_subscribe_task(conn, tid, notifier_profile="kurumi")
+        subs = kb.list_notify_subs(conn, tid)
+    finally:
+        conn.close()
+
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "tui"
+    assert subs[0]["chat_id"] == session_key
+    assert subs[0]["user_id"] == "user1"
+    assert subs[0]["notifier_profile"] == "kurumi"
 
 
 @pytest.mark.asyncio

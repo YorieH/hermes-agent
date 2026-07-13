@@ -71,6 +71,26 @@ class TestResetSessionStampsFreshReset:
         assert new_entry is not None
         assert new_entry.is_fresh_reset is True
 
+    def test_consume_fresh_reset_persists_false(self, tmp_path):
+        store = _make_store(tmp_path)
+        source = _make_source()
+        store.get_or_create_session(source)
+        session_key = store._generate_session_key(source)
+        store.reset_session(session_key)
+
+        assert store.consume_fresh_reset(session_key) is True
+
+        reloaded = _make_store(tmp_path)
+        entry = reloaded.get_or_create_session(source)
+        assert entry.is_fresh_reset is False
+
+    def test_consume_fresh_reset_returns_false_when_already_consumed(self, tmp_path):
+        store = _make_store(tmp_path)
+        source = _make_source()
+        entry = store.get_or_create_session(source)
+
+        assert store.consume_fresh_reset(entry.session_key) is False
+
     def test_reset_session_unknown_key_returns_none(self, tmp_path):
         store = _make_store(tmp_path)
         assert store.reset_session("unknown:key") is None

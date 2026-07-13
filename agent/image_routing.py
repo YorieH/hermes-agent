@@ -62,11 +62,12 @@ _IMAGE_EXTS = (
 )
 _IMAGE_EXT_PATTERN = "|".join(e.lstrip(".") for e in _IMAGE_EXTS)
 
-# Absolute / home-relative local image path. Matches the same shape gateway's
-# extract_local_files() uses: anchors to ``~/`` or ``/``, ignores matches inside
-# URLs (the ``(?<![/:\w.])`` lookbehind), and case-insensitive on the extension.
+# Absolute / home-relative local image path. Supports POSIX, tilde, and Windows
+# drive-letter paths, ignores matches inside URLs, and is case-insensitive on
+# the extension.
 _LOCAL_IMAGE_PATH_RE = re.compile(
-    r"(?<![/:\w.])(?:~/|/)(?:[\w.\-]+/)*[\w.\-]+\.(?:" + _IMAGE_EXT_PATTERN + r")\b",
+    r"(?<![/\\:\w.])(?:~/|/|[A-Za-z]:[/\\])"
+    r"(?:[\w.\-]+[/\\])*[\w.\-]+\.(?:" + _IMAGE_EXT_PATTERN + r")\b",
     re.IGNORECASE,
 )
 
@@ -119,7 +120,12 @@ def extract_image_refs(text: str) -> Tuple[List[str], List[str]]:
         if _in_code(match.start()):
             continue
         raw = match.group(0)
-        expanded = os.path.expanduser(raw)
+        if raw.startswith("~/") and os.environ.get("HOME"):
+            # CPython on Windows prefers USERPROFILE over HOME. Honor an
+            # explicit HOME so shell-origin and test paths resolve consistently.
+            expanded = str(Path(os.environ["HOME"]) / raw[2:])
+        else:
+            expanded = os.path.expanduser(raw)
         try:
             if not os.path.isfile(expanded):
                 continue

@@ -4,7 +4,7 @@ Provides a hostname-preserving fallback transport for networks where
 api.telegram.org resolves to an endpoint that is unreachable from the current
 host. The transport keeps the logical request host and TLS SNI as
 api.telegram.org while retrying the TCP connection against one or more fallback
-IPv4 addresses.
+IP addresses.
 """
 
 from __future__ import annotations
@@ -30,16 +30,31 @@ _DOH_PROVIDERS: list[dict] = [
         "url": "https://dns.google/resolve",
         "params": {"name": _TELEGRAM_API_HOST, "type": "A"},
         "headers": {},
+        "answer_type": 1,
+    },
+    {
+        "url": "https://dns.google/resolve",
+        "params": {"name": _TELEGRAM_API_HOST, "type": "AAAA"},
+        "headers": {},
+        "answer_type": 28,
     },
     {
         "url": "https://cloudflare-dns.com/dns-query",
         "params": {"name": _TELEGRAM_API_HOST, "type": "A"},
         "headers": {"Accept": "application/dns-json"},
+        "answer_type": 1,
+    },
+    {
+        "url": "https://cloudflare-dns.com/dns-query",
+        "params": {"name": _TELEGRAM_API_HOST, "type": "AAAA"},
+        "headers": {"Accept": "application/dns-json"},
+        "answer_type": 28,
     },
 ]
 
-# Last-resort IPs when DoH is also blocked.  These are stable Telegram Bot API
-# endpoints in the 149.154.160.0/20 block (same seed used by OpenClaw).
+# Last-resort IPv4 addresses when DoH is also blocked. These are stable
+# Telegram Bot API endpoints in the 149.154.160.0/20 block (same seed used by
+# OpenClaw).
 _SEED_FALLBACK_IPS: list[str] = ["149.154.166.110", "149.154.167.220"]
 
 
@@ -64,9 +79,25 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
         if proxy_url and "proxy" not in transport_kwargs:
             transport_kwargs["proxy"] = proxy_url
         self._primary = httpx.AsyncHTTPTransport(**transport_kwargs)
-        self._fallbacks = {
-            ip: httpx.AsyncHTTPTransport(**transport_kwargs) for ip in self._fallback_ips
-        }
+        local_address = transport_kwargs.get("local_address")
+        local_family = None
+        if local_address:
+            try:
+                local_family = ipaddress.ip_address(str(local_address)).version
+            except ValueError:
+                logger.warning(
+                    "Ignoring invalid Telegram transport local address: %r",
+                    local_address,
+                )
+        self._fallbacks = {}
+        for ip in self._fallback_ips:
+            fallback_kwargs = dict(transport_kwargs)
+            if local_family and ipaddress.ip_address(ip).version != local_family:
+                # A transport bound to an IPv4 source cannot open an IPv6
+                # socket (and vice versa). Keep the alternate family usable as
+                # a failover instead of poisoning every fallback transport.
+                fallback_kwargs.pop("local_address", None)
+            self._fallbacks[ip] = httpx.AsyncHTTPTransport(**fallback_kwargs)
         self._sticky_ip: Optional[str] = None
         self._sticky_lock = asyncio.Lock()
 
@@ -140,9 +171,6 @@ def _normalize_fallback_ips(values: Iterable[str]) -> list[str]:
         except ValueError:
             logger.warning("Ignoring invalid Telegram fallback IP: %r", raw)
             continue
-        if addr.version != 4:
-            logger.warning("Ignoring non-IPv4 Telegram fallback IP: %s", raw)
-            continue
         if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_unspecified:
             logger.warning("Ignoring private/internal Telegram fallback IP: %s", raw)
             continue
@@ -158,9 +186,15 @@ def parse_fallback_ip_env(value: str | None) -> list[str]:
 
 
 def _resolve_system_dns() -> set[str]:
-    """Return the IPv4 addresses that the OS resolver gives for api.telegram.org."""
+    """Return public IP addresses that the OS resolver gives for Telegram.
+
+    ``AF_UNSPEC`` is intentional. A host can have a broken IPv4 default route
+    while its IPv6 path remains healthy (or vice versa); keeping both address
+    families lets the fallback transport escape that failure without changing
+    machine-wide routing.
+    """
     try:
-        results = socket.getaddrinfo(_TELEGRAM_API_HOST, 443, socket.AF_INET)
+        results = socket.getaddrinfo(_TELEGRAM_API_HOST, 443, socket.AF_UNSPEC)
         return {addr[4][0] for addr in results}
     except Exception:
         return set()
@@ -178,7 +212,7 @@ async def _query_doh_provider(
         data = resp.json()
         ips: list[str] = []
         for answer in data.get("Answer", []):
-            if answer.get("type") != 1:  # A record
+            if answer.get("type") != provider["answer_type"]:
                 continue
             raw = answer.get("data", "").strip()
             try:
@@ -196,12 +230,12 @@ async def discover_fallback_ips() -> list[str]:
     """Auto-discover Telegram API IPs via DNS-over-HTTPS.
 
     Resolves api.telegram.org through Google and Cloudflare DoH and returns all
-    unique A records.  IPs that match the local system resolver are kept rather
-    than excluded: in many networks the system-DNS IP is the most reliable path
+    unique A and AAAA records. IPs that match the local system resolver are kept
+    rather than excluded: in many networks the system-DNS IP is the most reliable path
     to api.telegram.org and a transient primary-path failure should be retried
-    against the same address via the IP-rewrite path before the seed list is
-    consulted (#14520).  Falls back to a hardcoded seed list only when DoH
-    yields no usable answers.
+    against the same address via the IP-rewrite path (#14520).  Stable seed
+    addresses are appended after discovered routes so one narrow DNS/routing
+    failure does not leave every retry pointed at the same Telegram edge.
     """
     async with httpx.AsyncClient(timeout=httpx.Timeout(_DOH_TIMEOUT)) as client:
         doh_tasks = [_query_doh_provider(client, p) for p in _DOH_PROVIDERS]
@@ -216,10 +250,12 @@ async def discover_fallback_ips() -> list[str]:
         if isinstance(r, list):
             doh_ips.extend(r)
 
-    # Deduplicate preserving order
+    # Prefer DoH, then any system-DNS-only route, then stable seed diversity.
+    # Deduplicate preserving order so the best observed route is still tried
+    # first and a seed never adds latency after a successful sticky route.
     seen: set[str] = set()
     candidates: list[str] = []
-    for ip in doh_ips:
+    for ip in [*doh_ips, *sorted(system_ips), *_SEED_FALLBACK_IPS]:
         if ip not in seen:
             seen.add(ip)
             candidates.append(ip)
@@ -228,15 +264,12 @@ async def discover_fallback_ips() -> list[str]:
     validated = _normalize_fallback_ips(candidates)
 
     if validated:
-        logger.debug("Discovered Telegram fallback IPs via DoH: %s", ", ".join(validated))
+        logger.debug("Resolved Telegram fallback routes: %s", ", ".join(validated))
         return validated
 
-    logger.info(
-        "DoH discovery yielded no usable IPs (system DNS: %s); using seed fallback IPs %s",
-        ", ".join(system_ips) or "unknown",
-        ", ".join(_SEED_FALLBACK_IPS),
-    )
-    return list(_SEED_FALLBACK_IPS)
+    # The seeds above are valid constants, so this is defensive only.
+    logger.warning("Telegram fallback route discovery produced no valid IP addresses")
+    return []
 
 
 def _rewrite_request_for_ip(request: httpx.Request, ip: str) -> httpx.Request:

@@ -42,10 +42,13 @@ import base64
 import json
 import logging
 import os
+from pathlib import Path
 import re
 import struct
 import sys
 import threading
+import time
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from tools.computer_use.backend import (
@@ -56,6 +59,8 @@ from tools.computer_use.backend import (
 )
 
 logger = logging.getLogger(__name__)
+
+_DESKTOP_LOCK_TOKEN = f"{os.getpid()}-{uuid.uuid4().hex}"
 
 
 # ---------------------------------------------------------------------------
@@ -76,14 +81,29 @@ def set_approval_callback(cb) -> None:
     _approval_callback = cb
 
 
-# Actions that read, not mutate. Always allowed.
-_SAFE_ACTIONS = frozenset({"capture", "wait", "list_apps"})
+# Actions that read, not mutate user-visible desktop state. Always allowed.
+_SAFE_ACTIONS = frozenset({
+    "capture",
+    "wait",
+    "list_apps",
+    "desktop_lock_status",
+    "acquire_desktop_lock",
+    "release_desktop_lock",
+})
 
 # Actions that mutate user-visible state. Go through approval.
 _DESTRUCTIVE_ACTIONS = frozenset({
     "click", "double_click", "right_click", "middle_click",
     "drag", "scroll", "type", "key", "set_value", "focus_app",
 })
+
+_DESKTOP_LOCK_ACTIONS = frozenset({
+    "click", "double_click", "right_click", "middle_click",
+    "drag", "scroll", "type", "key", "set_value", "focus_app",
+})
+
+_DEFAULT_DESKTOP_LOCK_TTL_SECONDS = 180
+_DESKTOP_LOCK_MAX_TTL_SECONDS = 900
 
 # Hard-blocked key combinations. Mirrored from #4562 — these are destructive
 # regardless of approval level (e.g. logout kills the session Hermes runs in).
@@ -132,6 +152,214 @@ def _is_blocked_type(text: str) -> Optional[str]:
     return None
 
 
+def _desktop_lock_owner() -> str:
+    for key in ("HERMES_PROFILE", "HERMES_ACTIVE_PROFILE", "HERMES_AGENT_PROFILE"):
+        value = (os.environ.get(key) or "").strip()
+        if value:
+            return value
+    home = (os.environ.get("HERMES_HOME") or "").strip()
+    if home:
+        name = Path(home).name
+        if name:
+            return name
+    return f"pid-{os.getpid()}"
+
+
+def _desktop_lock_path() -> Path:
+    root = os.environ.get("HERMES_DESKTOP_LOCK_DIR")
+    if root:
+        base = Path(root)
+    else:
+        local = os.environ.get("LOCALAPPDATA")
+        base = Path(local) / "hermes" / "locks" if local else Path.home() / ".hermes" / "locks"
+    return base / "desktop-control.lock.json"
+
+
+def _desktop_lock_ttl(args: Optional[Dict[str, Any]] = None) -> int:
+    raw = args.get("ttl_seconds") if args else None
+    if raw is None:
+        raw = os.environ.get("HERMES_DESKTOP_LOCK_TTL_SECONDS")
+    try:
+        ttl = int(raw) if raw is not None else _DEFAULT_DESKTOP_LOCK_TTL_SECONDS
+    except (TypeError, ValueError):
+        ttl = _DEFAULT_DESKTOP_LOCK_TTL_SECONDS
+    return max(30, min(_DESKTOP_LOCK_MAX_TTL_SECONDS, ttl))
+
+
+def _read_desktop_lock(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return {"owner": "unknown", "expires_at": 0, "corrupt": True}
+
+
+def _write_desktop_lock(path: Path, payload: Dict[str, Any], *, exclusive: bool) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    if exclusive:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+        return
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(data, encoding="utf-8")
+    os.replace(str(tmp), str(path))
+
+
+def _acquire_desktop_lock_guard(path: Path) -> Optional[Path]:
+    """Serialize lock-file read/modify/write cycles across worker processes."""
+    guard = path.with_name(f"{path.name}.guard")
+    guard.parent.mkdir(parents=True, exist_ok=True)
+    for _ in range(25):
+        try:
+            fd = os.open(str(guard), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(f"{os.getpid()} {time.time()}\n")
+            return guard
+        except FileExistsError:
+            try:
+                if time.time() - guard.stat().st_mtime > 10:
+                    guard.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+            time.sleep(0.01)
+    return None
+
+
+def _release_desktop_lock_guard(guard: Optional[Path]) -> None:
+    if guard is None:
+        return
+    try:
+        guard.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _desktop_lock_payload(owner: str, args: Optional[Dict[str, Any]], ttl: int) -> Dict[str, Any]:
+    now = time.time()
+    purpose = ""
+    if args:
+        purpose = str(args.get("purpose") or args.get("app") or "").strip()
+    return {
+        "owner": owner,
+        "pid": os.getpid(),
+        "lease_token": _DESKTOP_LOCK_TOKEN,
+        "purpose": purpose,
+        "created_or_refreshed_at": now,
+        "expires_at": now + ttl,
+        "ttl_seconds": ttl,
+    }
+
+
+def _format_desktop_lock(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    now = time.time()
+    if not state:
+        return {"locked": False}
+    expires_at = float(state.get("expires_at") or 0)
+    return {
+        "locked": expires_at > now,
+        "owner": state.get("owner"),
+        "pid": state.get("pid"),
+        "purpose": state.get("purpose") or "",
+        "expires_at": expires_at,
+        "seconds_remaining": max(0, round(expires_at - now, 1)),
+        "corrupt": bool(state.get("corrupt")),
+    }
+
+
+def _acquire_desktop_lock(args: Optional[Dict[str, Any]] = None) -> Tuple[bool, Dict[str, Any]]:
+    owner = _desktop_lock_owner()
+    ttl = _desktop_lock_ttl(args)
+    path = _desktop_lock_path()
+    payload = _desktop_lock_payload(owner, args, ttl)
+
+    guard = _acquire_desktop_lock_guard(path)
+    if guard is None:
+        return False, {"error": "desktop control lock is busy", "path": str(path)}
+    try:
+        state = _read_desktop_lock(path)
+        formatted = _format_desktop_lock(state)
+        current_owner = str((state or {}).get("owner") or "")
+        current_token = str((state or {}).get("lease_token") or "")
+        current_pid = int((state or {}).get("pid") or 0)
+        same_holder = current_owner == owner and (
+            current_token == _DESKTOP_LOCK_TOKEN
+            or (not current_token and current_pid == os.getpid())
+        )
+        if formatted.get("locked") and not same_holder:
+            lock_error = (
+                "desktop control is locked by another profile"
+                if current_owner != owner
+                else "desktop control is locked by another worker for this profile"
+            )
+            return False, {
+                "error": lock_error,
+                "owner": formatted.get("owner"),
+                "purpose": formatted.get("purpose"),
+                "seconds_remaining": formatted.get("seconds_remaining"),
+                "hint": "Coordinate through the shared kanban board or wait for the lease to expire.",
+            }
+        _write_desktop_lock(path, payload, exclusive=state is None)
+        return True, {
+            "locked": True,
+            "owner": owner,
+            "acquired": not same_holder,
+            "refreshed": same_holder,
+            "path": str(path),
+        }
+    finally:
+        _release_desktop_lock_guard(guard)
+
+
+def _release_desktop_lock() -> Dict[str, Any]:
+    owner = _desktop_lock_owner()
+    path = _desktop_lock_path()
+    guard = _acquire_desktop_lock_guard(path)
+    if guard is None:
+        return {"released": False, "error": "desktop control lock is busy"}
+    try:
+        state = _read_desktop_lock(path)
+        formatted = _format_desktop_lock(state)
+        if not state or not formatted.get("locked"):
+            path.unlink(missing_ok=True)
+            return {"released": False, "locked": False}
+        current_owner = str(state.get("owner") or "")
+        current_token = str(state.get("lease_token") or "")
+        current_pid = int(state.get("pid") or 0)
+        same_holder = current_owner == owner and (
+            current_token == _DESKTOP_LOCK_TOKEN
+            or (not current_token and current_pid == os.getpid())
+        )
+        if not same_holder:
+            lock_error = (
+                "desktop control lock belongs to another profile"
+                if current_owner != owner
+                else "desktop control lock belongs to another worker for this profile"
+            )
+            return {
+                "released": False,
+                "locked": True,
+                "owner": current_owner,
+                "seconds_remaining": formatted.get("seconds_remaining"),
+                "error": lock_error,
+            }
+        path.unlink(missing_ok=True)
+        return {"released": True, "locked": False, "owner": owner}
+    finally:
+        _release_desktop_lock_guard(guard)
+
+
+def _desktop_lock_status() -> Dict[str, Any]:
+    path = _desktop_lock_path()
+    state = _read_desktop_lock(path)
+    formatted = _format_desktop_lock(state)
+    formatted["path"] = str(path)
+    return formatted
+
+
 # ---------------------------------------------------------------------------
 # Backend selection — env-swappable for tests
 # ---------------------------------------------------------------------------
@@ -142,6 +370,28 @@ _backend: Optional[ComputerUseBackend] = None
 # Session-scoped approval state.
 _session_auto_approve = False
 _always_allow: set = set()  # action names the user unlocked for the session
+
+
+def _computer_use_auto_approve_enabled() -> bool:
+    raw = os.environ.get("HERMES_COMPUTER_USE_AUTO_APPROVE")
+    if raw is not None:
+        return raw.strip().lower() in {"1", "true", "yes", "on", "always"}
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config() or {}
+        cu = cfg.get("computer_use") if isinstance(cfg, dict) else {}
+        value = cu.get("auto_approve", False) if isinstance(cu, dict) else False
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on", "always"}
+        return False
+    except Exception:
+        logger.debug("computer_use: failed to read auto_approve config", exc_info=True)
+        return False
 
 
 def _get_backend() -> ComputerUseBackend:
@@ -245,6 +495,14 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
     if not action:
         return json.dumps({"error": "missing `action`"})
 
+    if action == "desktop_lock_status":
+        return json.dumps(_desktop_lock_status())
+    if action == "acquire_desktop_lock":
+        _ok, state = _acquire_desktop_lock(args)
+        return json.dumps(state)
+    if action == "release_desktop_lock":
+        return json.dumps(_release_desktop_lock())
+
     # Safety: validate actions before approval prompt.
     if action == "type":
         text = args.get("text", "")
@@ -271,6 +529,11 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
         if err is not None:
             return err
 
+    if action in _DESKTOP_LOCK_ACTIONS:
+        ok, state = _acquire_desktop_lock(args)
+        if not ok:
+            return json.dumps(state)
+
     # Dispatch to backend.
     try:
         backend = _get_backend()
@@ -291,6 +554,8 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
 def _request_approval(action: str, args: Dict[str, Any]) -> Optional[str]:
     """Return None if approved, or a JSON error string if denied."""
     global _session_auto_approve, _always_allow
+    if _computer_use_auto_approve_enabled():
+        return None
     if _session_auto_approve:
         return None
     if action in _always_allow:
@@ -625,9 +890,20 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
         # to base64-prefix sniffing for older cua-driver builds that didn't
         # carry the field. JPEG base64 starts with /9j/; PNG with iVBOR.
         _mime = cap.image_mime_type
+        _img_b64 = cap.png_b64
         if not _mime:
             _b64_prefix = cap.png_b64[:8]
             _mime = "image/jpeg" if _b64_prefix.startswith("/9j/") else "image/png"
+        # Native-resolution PNG desktop captures are ~3-5MB of base64 EACH and
+        # accumulate in conversation history; ~30 captures stalled a worker's
+        # provider requests outright (2026-07-05). Transcode large PNGs to
+        # JPEG at IDENTICAL resolution — coordinates derived from the image
+        # stay valid, payload drops ~8-12x. Resolution must NOT change here:
+        # response_width/height and the model's pixel picks depend on it.
+        if _mime == "image/png" and len(_img_b64) > _MULTIMODAL_JPEG_THRESHOLD_B64:
+            _jpeg_b64 = _transcode_png_b64_to_jpeg(_img_b64)
+            if _jpeg_b64 is not None:
+                _img_b64, _mime = _jpeg_b64, "image/jpeg"
         # The multimodal response carries the screenshot, not the AX
         # elements array, so a "response truncated to N of M elements"
         # note would be inaccurate — skip it on this branch.
@@ -636,7 +912,7 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
             "content": [
                 {"type": "text", "text": summary},
                 {"type": "image_url",
-                 "image_url": {"url": f"data:{_mime};base64,{cap.png_b64}"}},
+                 "image_url": {"url": f"data:{_mime};base64,{_img_b64}"}},
             ],
             "text_summary": summary,
             "meta": {"mode": cap.mode, "width": response_width, "height": response_height,
@@ -673,6 +949,35 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
 # captures tokenize heavily and can overflow small local-model context windows;
 # ~1456px keeps SOM badges legible while cutting per-capture vision latency.
 _MAX_VISION_DIM = 1456
+
+# PNG captures whose base64 exceeds this are JPEG-transcoded (same resolution)
+# before entering the multimodal envelope. ~1MB base64 ≈ 750KB PNG; anything
+# above that is a full-res desktop capture that would bloat history.
+_MULTIMODAL_JPEG_THRESHOLD_B64 = int(
+    os.environ.get("HERMES_CUA_JPEG_THRESHOLD_B64", "1000000") or 1000000)
+_MULTIMODAL_JPEG_QUALITY = 80
+
+
+def _transcode_png_b64_to_jpeg(png_b64: str,
+                               quality: int = _MULTIMODAL_JPEG_QUALITY) -> Optional[str]:
+    """Re-encode a base64 PNG as base64 JPEG at the SAME pixel dimensions.
+
+    Returns None on any failure (missing Pillow, corrupt data) so the caller
+    keeps the original PNG — never worse than the pre-transcode behavior.
+    """
+    try:
+        import base64 as _base64
+        from io import BytesIO
+        from PIL import Image
+        img = Image.open(BytesIO(_base64.b64decode(png_b64, validate=False)))
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        out = BytesIO()
+        img.save(out, format="JPEG", quality=quality)
+        return _base64.b64encode(out.getvalue()).decode("ascii")
+    except Exception as exc:
+        logger.debug("computer_use: multimodal JPEG transcode skipped: %s", exc)
+        return None
 
 
 def _shrink_capture_for_vision(raw: bytes, ext: str,

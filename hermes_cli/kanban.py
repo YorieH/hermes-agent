@@ -627,6 +627,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=None,
         help="Permanently delete already-archived task ids from the board",
     )
+    p_archive.add_argument(
+        "--force-running",
+        action="store_true",
+        help="Allow archiving claimed/running tasks. Without this, archive refuses active work.",
+    )
 
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
@@ -1003,6 +1008,16 @@ def _profile_author() -> str:
         return "user"
 
 
+def _current_session_id() -> Optional[str]:
+    try:
+        from gateway.session_context import get_session_env
+
+        value = get_session_env("HERMES_SESSION_ID", "")
+    except Exception:
+        value = os.environ.get("HERMES_SESSION_ID", "")
+    return value or None
+
+
 # ---------------------------------------------------------------------------
 # Boards management (hermes kanban boards …)
 # ---------------------------------------------------------------------------
@@ -1347,8 +1362,22 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            session_id=_current_session_id(),
         )
         task = kb.get_task(conn, task_id)
+        try:
+            from hermes_cli.kanban_notify import maybe_auto_subscribe_task
+
+            maybe_auto_subscribe_task(
+                conn,
+                task_id,
+                notifier_profile=(
+                    os.environ.get("HERMES_KANBAN_NOTIFIER_PROFILE")
+                    or _profile_author()
+                ),
+            )
+        except Exception:
+            pass
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
@@ -2088,9 +2117,13 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                     print(f"Deleted {tid}")
             return 0 if not failed else 1
         for tid in ids:
-            if not kb.archive_task(conn, tid):
+            if not kb.archive_task(conn, tid, allow_running=args.force_running):
                 failed.append(tid)
-                print(f"cannot archive {tid}", file=sys.stderr)
+                print(
+                    f"cannot archive {tid} (not found, already archived, or active; "
+                    "use --force-running for active tasks)",
+                    file=sys.stderr,
+                )
             else:
                 print(f"Archived {tid}")
     return 0 if not failed else 1
@@ -2141,6 +2174,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             _kanban_cfg.get("max_in_progress_per_profile")
         )
         max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
+        default_max_runtime_seconds = _coerce_positive_int(
+            _kanban_cfg.get("worker_default_max_runtime_seconds")
+        )
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
         cli_max = getattr(args, "max", None)
@@ -2151,6 +2187,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         default_assignee = None
         max_in_progress_per_profile = None
         max_in_progress = None
+        default_max_runtime_seconds = None
         max_spawn = getattr(args, "max", None)
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
@@ -2161,6 +2198,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            default_max_runtime_seconds=default_max_runtime_seconds,
         )
     if getattr(args, "json", False):
         print(json.dumps({

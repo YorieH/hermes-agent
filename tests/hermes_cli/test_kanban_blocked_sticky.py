@@ -99,6 +99,191 @@ def test_worker_block_on_child_with_done_parents_is_still_sticky(kanban_home: Pa
         assert kb.get_task(conn, child).status == "blocked"
 
 
+def test_review_required_block_creates_coordinator_review_task(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review-required sticky blocks should route to the coordinator."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"orchestrator_profile": "kairi"}},
+    )
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="feature lane",
+            assignee="asuna",
+            session_id="session-1",
+            max_runtime_seconds=7200,
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat1",
+            user_id="user1",
+            notifier_profile="kairi",
+        )
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="review-required: merge into dirty main tree",
+            expected_run_id=run_id,
+        )
+
+        review = conn.execute(
+            "SELECT * FROM tasks WHERE idempotency_key = ?",
+            (f"coordinator-review:{tid}",),
+        ).fetchone()
+        assert review is not None
+        assert review["status"] == "ready"
+        assert review["assignee"] == "kairi"
+        assert review["session_id"] == "session-1"
+        assert "Do not leave this as a silent human-only blocker" in review["body"]
+        assert "Completion rule: do not complete this coordinator task" in review["body"]
+
+        subs = kb.list_notify_subs(conn, review["id"])
+        assert len(subs) == 1
+        assert subs[0]["platform"] == "telegram"
+        assert subs[0]["chat_id"] == "chat1"
+
+        events = kb.list_events(conn, tid)
+        requested = [e for e in events if e.kind == "coordinator_review_requested"]
+        assert len(requested) == 1
+        assert requested[0].payload["review_task_id"] == review["id"]
+        assert requested[0].payload["coordinator"] == "kairi"
+
+
+def test_review_required_block_without_coordinator_keeps_legacy_behavior(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No configured coordinator means no surprise extra task."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"orchestrator_profile": ""}},
+    )
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="feature lane", assignee="asuna")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="review-required: needs sign-off",
+            expected_run_id=run_id,
+        )
+
+        review_rows = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key LIKE 'coordinator-review:%'"
+        ).fetchall()
+        assert review_rows == []
+
+
+def test_dispatch_backfills_missing_coordinator_review_task(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dispatcher scans cover blocks written by already-running old workers."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"orchestrator_profile": "kairi"}},
+    )
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="old worker block", assignee="kurumi")
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+
+        with kb.write_txn(conn):
+            conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'blocked',
+                       claim_lock = NULL,
+                       claim_expires = NULL,
+                       worker_pid = NULL
+                 WHERE id = ?
+                """,
+                (tid,),
+            )
+            kb._append_event(
+                conn,
+                tid,
+                "blocked",
+                {"reason": "review-required: old worker handoff"},
+                run_id=run_id,
+            )
+
+        ensured = kb.ensure_coordinator_review_tasks(conn)
+        assert len(ensured) == 1
+        review = kb.get_task(conn, ensured[0])
+        assert review.assignee == "kairi"
+        assert review.status == "ready"
+        assert review.idempotency_key == f"coordinator-review:{tid}"
+
+        # Second pass must not create another coordinator task.
+        assert kb.ensure_coordinator_review_tasks(conn) == [ensured[0]]
+        rows = conn.execute(
+            "SELECT id FROM tasks WHERE idempotency_key LIKE 'coordinator-review:%'"
+        ).fetchall()
+        assert len(rows) == 1
+
+
+def test_coordinator_review_limit_counts_new_cards_not_existing_cards(
+    kanban_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"orchestrator_profile": "kairi"}},
+    )
+
+    with kb.connect() as conn:
+        blocked_ids = []
+        for index in range(2):
+            tid = kb.create_task(
+                conn,
+                title=f"review backlog {index}",
+                assignee="kurumi",
+            )
+            kb.claim_task(conn, tid)
+            run_id = kb.get_task(conn, tid).current_run_id
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+                    "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+                    (tid,),
+                )
+                kb._append_event(
+                    conn,
+                    tid,
+                    "blocked",
+                    {"reason": f"review-required: backlog {index}"},
+                    run_id=run_id,
+                )
+            blocked_ids.append(tid)
+
+        first = kb.ensure_coordinator_review_tasks(conn, limit=1)
+        assert len(first) == 1
+
+        second = kb.ensure_coordinator_review_tasks(conn, limit=1)
+        review_rows = conn.execute(
+            "SELECT idempotency_key FROM tasks "
+            "WHERE idempotency_key LIKE 'coordinator-review:%'"
+        ).fetchall()
+
+    assert len(second) == 2
+    assert len(review_rows) == 2
+    assert all(any(tid in row["idempotency_key"] for tid in blocked_ids) for row in review_rows)
+
+
 # ---------------------------------------------------------------------------
 # Circuit-breaker blocks still auto-recover (preserve #40c1decb3 intent)
 # ---------------------------------------------------------------------------

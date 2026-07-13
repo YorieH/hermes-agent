@@ -60,11 +60,13 @@ def _fake_transport_factory(calls, behavior):
     instances = []
 
     def factory(**kwargs):
+        factory.kwargs.append(dict(kwargs))
         t = FakeTransport(calls, behavior)
         instances.append(t)
         return t
 
     factory.instances = instances
+    factory.kwargs = []
     return factory
 
 
@@ -77,11 +79,10 @@ def _telegram_request(path="/botTOKEN/getMe"):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestParseFallbackIpEnv:
-    def test_filters_invalid_and_ipv6(self, caplog):
+    def test_filters_invalid_and_accepts_ipv6(self, caplog):
         ips = tnet.parse_fallback_ip_env("149.154.167.220, bad, 2001:67c:4e8:f004::9,149.154.167.220")
-        assert ips == ["149.154.167.220", "149.154.167.220"]
+        assert ips == ["149.154.167.220", "2001:67c:4e8:f004::9", "149.154.167.220"]
         assert "Ignoring invalid Telegram fallback IP" in caplog.text
-        assert "Ignoring non-IPv4 Telegram fallback IP" in caplog.text
 
     def test_none_returns_empty(self):
         assert tnet.parse_fallback_ip_env(None) == []
@@ -137,6 +138,14 @@ class TestRewriteRequestForIp:
         assert rewritten.method == "POST"
         assert rewritten.url.path == "/botTOKEN/sendMessage"
 
+    def test_ipv6_address_is_bracketed_and_preserves_sni(self):
+        request = _telegram_request()
+        rewritten = tnet._rewrite_request_for_ip(request, "2001:67c:4e8:f004::9")
+
+        assert str(rewritten.url).startswith("https://[2001:67c:4e8:f004::9]/")
+        assert rewritten.headers["host"] == "api.telegram.org"
+        assert rewritten.extensions["sni_hostname"] == "api.telegram.org"
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Fallback transport – core behavior
@@ -144,6 +153,20 @@ class TestRewriteRequestForIp:
 
 class TestFallbackTransport:
     """Primary path fails → try fallback IPs → stick to whichever works."""
+
+    def test_local_address_is_not_applied_across_address_families(self, monkeypatch):
+        calls = []
+        factory = _fake_transport_factory(calls, {})
+        monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", factory)
+
+        tnet.TelegramFallbackTransport(
+            ["149.154.167.220", "2001:67c:4e8:f004::9"],
+            local_address="192.168.3.224",
+        )
+
+        assert factory.kwargs[0]["local_address"] == "192.168.3.224"
+        assert factory.kwargs[1]["local_address"] == "192.168.3.224"
+        assert "local_address" not in factory.kwargs[2]
 
     @pytest.mark.asyncio
     async def test_falls_back_on_connect_timeout_and_becomes_sticky(self, monkeypatch):
@@ -567,6 +590,22 @@ class TestDiscoverFallbackIps:
         assert "149.154.167.221" in ips
 
     @pytest.mark.asyncio
+    async def test_aaaa_record_is_collected_from_doh(self, monkeypatch):
+        answer = {
+            "Answer": [
+                {"type": 1, "data": "149.154.166.110"},
+                {"type": 28, "data": "2001:67c:4e8:f004::9"},
+            ]
+        }
+        self._patch_doh(monkeypatch, {
+            "https://dns.google": (200, answer),
+            "https://cloudflare-dns.com": (200, {"Status": 0}),
+        }, system_dns_ips=[])
+
+        ips = await tnet.discover_fallback_ips()
+        assert ips[:2] == ["149.154.166.110", "2001:67c:4e8:f004::9"]
+
+    @pytest.mark.asyncio
     async def test_system_dns_ip_kept_when_doh_confirms(self, monkeypatch):
         """DoH-confirmed IPs are kept even when they match system DNS (#14520).
 
@@ -590,7 +629,7 @@ class TestDiscoverFallbackIps:
         }, system_dns_ips=["149.154.166.110"])
 
         ips = await tnet.discover_fallback_ips()
-        assert ips == ["149.154.167.220"]
+        assert ips == ["149.154.167.220", "149.154.166.110"]
 
     @pytest.mark.asyncio
     async def test_doh_timeout_falls_back_to_seed(self, monkeypatch):
@@ -630,7 +669,7 @@ class TestDiscoverFallbackIps:
         }, system_dns_ips=["149.154.166.110"])
 
         ips = await tnet.discover_fallback_ips()
-        assert ips == ["149.154.167.220"]
+        assert ips == ["149.154.167.220", "149.154.166.110"]
 
     @pytest.mark.asyncio
     async def test_system_dns_failure_keeps_all_doh_ips(self, monkeypatch):
@@ -643,6 +682,16 @@ class TestDiscoverFallbackIps:
         ips = await tnet.discover_fallback_ips()
         assert "149.154.166.110" in ips
         assert "149.154.167.220" in ips
+
+    @pytest.mark.asyncio
+    async def test_system_dns_ipv6_is_kept_as_a_fallback_route(self, monkeypatch):
+        self._patch_doh(monkeypatch, {
+            "https://dns.google": (200, _doh_answer("149.154.166.110")),
+            "https://cloudflare-dns.com": (200, _doh_answer()),
+        }, system_dns_ips=["2001:67c:4e8:f004::9"])
+
+        ips = await tnet.discover_fallback_ips()
+        assert ips[:2] == ["149.154.166.110", "2001:67c:4e8:f004::9"]
 
     @pytest.mark.asyncio
     async def test_all_doh_ips_same_as_system_dns_kept(self, monkeypatch):
@@ -659,7 +708,7 @@ class TestDiscoverFallbackIps:
         }, system_dns_ips=["149.154.166.110"])
 
         ips = await tnet.discover_fallback_ips()
-        assert ips == ["149.154.166.110"]
+        assert ips == ["149.154.166.110", "149.154.167.220"]
 
     @pytest.mark.asyncio
     async def test_cloudflare_gets_accept_header(self, monkeypatch):
@@ -675,8 +724,8 @@ class TestDiscoverFallbackIps:
         assert cf_reqs[0]["headers"]["Accept"] == "application/dns-json"
 
     @pytest.mark.asyncio
-    async def test_non_a_records_ignored(self, monkeypatch):
-        """AAAA records (type 28) and CNAME (type 5) should be skipped."""
+    async def test_supported_address_records_kept_and_cname_ignored(self, monkeypatch):
+        """A and AAAA records are routes; CNAME answers are not."""
         answer = {
             "Answer": [
                 {"type": 5, "data": "telegram.org"},  # CNAME
@@ -690,7 +739,11 @@ class TestDiscoverFallbackIps:
         }, system_dns_ips=["149.154.166.110"])
 
         ips = await tnet.discover_fallback_ips()
-        assert ips == ["149.154.167.220"]
+        assert ips == [
+            "149.154.167.220",
+            "2001:67c:4e8:f004::9",
+            "149.154.166.110",
+        ]
 
     @pytest.mark.asyncio
     async def test_invalid_ip_in_doh_response_skipped(self, monkeypatch):
@@ -704,4 +757,4 @@ class TestDiscoverFallbackIps:
         }, system_dns_ips=["149.154.166.110"])
 
         ips = await tnet.discover_fallback_ips()
-        assert ips == ["149.154.167.220"]
+        assert ips == ["149.154.167.220", "149.154.166.110"]

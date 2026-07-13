@@ -1,8 +1,10 @@
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
 
 
 from gateway.config import Platform
+from gateway.session import SessionSource
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
 
@@ -13,6 +15,15 @@ class RecordingAdapter:
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+
+
+class RecordingHandleAdapter(RecordingAdapter):
+    def __init__(self):
+        super().__init__()
+        self.events = []
+
+    async def handle_message(self, event):
+        self.events.append(event)
 
 
 class DisconnectedAdapters(dict):
@@ -103,6 +114,118 @@ def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatc
 
     assert len(adapter1.sent) == 1
     assert adapter2.sent == []
+
+
+def test_profile_owned_subscription_is_claimed_only_by_its_gateway(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "profile-owned.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="owned notification", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-asuna",
+            notifier_profile="asuna",
+        )
+        kb.complete_task(conn, tid, summary="done by Asuna")
+    finally:
+        conn.close()
+
+    kurumi_adapter = RecordingAdapter()
+    kurumi_runner = _make_runner(kurumi_adapter)
+    kurumi_runner._kanban_notifier_profile = "kurumi"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, kurumi_runner))
+
+    assert kurumi_adapter.sent == []
+    assert [
+        ev.kind for ev in _unseen_terminal_events_for(tid, "chat-asuna")
+    ] == ["completed"]
+
+    asuna_adapter = RecordingAdapter()
+    asuna_runner = _make_runner(asuna_adapter)
+    asuna_runner._kanban_notifier_profile = "asuna"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, asuna_runner))
+
+    assert len(asuna_adapter.sent) == 1
+    assert asuna_adapter.sent[0]["chat_id"] == "chat-asuna"
+
+
+def test_kanban_notifier_skips_external_wake_without_handle_message(tmp_path, monkeypatch, caplog):
+    db_path = tmp_path / "send-only-adapter.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="send-only wake",
+            assignee="worker",
+            session_id="agent:main:telegram:dm:chat-1",
+        )
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert "wakeup injection failed" not in caplog.text
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, tid) == []
+    finally:
+        conn.close()
+
+
+def test_kanban_notifier_batches_same_session_agent_wakes(tmp_path, monkeypatch):
+    db_path = tmp_path / "batched-agent-wakes.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        task_ids = []
+        for index in range(2):
+            tid = kb.create_task(
+                conn,
+                title=f"batched completion {index}",
+                assignee="worker",
+                session_id="agent:main:telegram:group:chat-1",
+            )
+            kb.add_notify_sub(
+                conn,
+                task_id=tid,
+                platform="telegram",
+                chat_id="chat-1",
+            )
+            kb.complete_task(conn, tid, summary=f"done {index}")
+            task_ids.append(tid)
+    finally:
+        conn.close()
+
+    adapter = RecordingHandleAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 2
+    assert len(adapter.events) == 1
+    wake = adapter.events[0]
+    assert wake.internal is True
+    assert "2 task updates arrived together" in wake.text
+    assert all(tid in wake.text for tid in task_ids)
 
 
 def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypatch):
@@ -305,5 +428,154 @@ def _unseen_terminal_events_for(tid, chat_id):
             kinds=["completed", "blocked", "gave_up", "crashed", "timed_out"],
         )
         return events
+    finally:
+        conn.close()
+
+
+def test_kanban_notifier_injects_internal_session_subscription(tmp_path, monkeypatch):
+    """platform=tui + chat_id=agent:* rows wake the owning agent session."""
+    db_path = tmp_path / "internal-wake.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    session_key = "agent:main:telegram:dm:chat-1"
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="synthesize helper result", assignee="asuna")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="tui",
+            chat_id=session_key,
+            notifier_profile="kurumi",
+        )
+        kb.complete_task(conn, tid, summary="Asuna finished the UX audit.")
+    finally:
+        conn.close()
+
+    adapter = RecordingHandleAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_notifier_profile = "kurumi"
+    runner.session_store = SimpleNamespace(
+        _entries={
+            session_key: SimpleNamespace(
+                origin=SessionSource(
+                    platform=Platform.TELEGRAM,
+                    chat_id="chat-1",
+                    chat_type="dm",
+                    user_id="user-1",
+                    user_name="Haru",
+                )
+            )
+        },
+        _ensure_loaded=lambda: None,
+    )
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert len(adapter.events) == 1
+    assert adapter.events[0].internal is True
+    assert "[KANBAN TASK COMPLETE" in adapter.events[0].text
+    assert tid in adapter.events[0].text
+    assert "Asuna finished the UX audit." in adapter.events[0].text
+
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, tid) == []
+    finally:
+        conn.close()
+
+
+def test_kanban_notifier_injects_internal_review_and_unblock_events(tmp_path, monkeypatch):
+    """Coordinator review and unblock events should wake the orchestrator."""
+    db_path = tmp_path / "internal-review-wake.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    session_key = "agent:main:telegram:dm:chat-1"
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="review handoff", assignee="kurumi")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="tui",
+            chat_id=session_key,
+            notifier_profile="kurumi",
+        )
+        kb._append_event(
+            conn,
+            tid,
+            "coordinator_review_requested",
+            {
+                "review_task_id": "t_review01",
+                "coordinator": "kairi",
+                "reason": "review-required: proof check",
+            },
+        )
+        kb._append_event(conn, tid, "unblocked", {"status": "ready"})
+    finally:
+        conn.close()
+
+    adapter = RecordingHandleAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_notifier_profile = "kurumi"
+    runner.session_store = SimpleNamespace(
+        _entries={
+            session_key: SimpleNamespace(
+                origin=SessionSource(
+                    platform=Platform.TELEGRAM,
+                    chat_id="chat-1",
+                    chat_type="dm",
+                    user_id="user-1",
+                    user_name="Haru",
+                )
+            )
+        },
+        _ensure_loaded=lambda: None,
+    )
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    texts = [event.text for event in adapter.events]
+    assert any("[KANBAN TASK REVIEW REQUESTED" in text for text in texts)
+    assert any("Review task: t_review01" in text for text in texts)
+    assert any("[KANBAN TASK UNBLOCKED" in text for text in texts)
+
+
+def test_kanban_notifier_drops_archived_internal_subscription(tmp_path, monkeypatch):
+    """Stale archived cards must not resurrect old agent work."""
+    db_path = tmp_path / "archived-internal-wake.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    session_key = "agent:main:telegram:dm:chat-1"
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="old archived helper", assignee="kairi")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="tui",
+            chat_id=session_key,
+            notifier_profile="kurumi",
+        )
+        kb.complete_task(conn, tid, summary="Old result.")
+        assert kb.archive_task(conn, tid)
+    finally:
+        conn.close()
+
+    adapter = RecordingHandleAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_notifier_profile = "kurumi"
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert adapter.events == []
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, tid) == []
     finally:
         conn.close()

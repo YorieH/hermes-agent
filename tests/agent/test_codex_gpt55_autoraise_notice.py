@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 from pathlib import Path
 
 import pytest
@@ -35,6 +36,34 @@ from agent.agent_init import (
 
 # The dict agent_init stashes when the Codex gpt-5.5 override fires.
 AUTORAISE = {"model": "gpt-5.5", "from": 0.50, "to": 0.85}
+
+
+_SESSION_ENV_KEYS = (
+    "HERMES_SESSION_PLATFORM",
+    "HERMES_SESSION_SOURCE",
+    "HERMES_SESSION_CHAT_ID",
+    "HERMES_SESSION_CHAT_NAME",
+    "HERMES_SESSION_THREAD_ID",
+    "HERMES_SESSION_USER_ID",
+    "HERMES_SESSION_USER_NAME",
+    "HERMES_SESSION_KEY",
+    "HERMES_SESSION_ID",
+    "HERMES_SESSION_MESSAGE_ID",
+    "HERMES_SESSION_PROFILE",
+)
+
+
+@pytest.fixture(autouse=True)
+def _restore_session_context():
+    from gateway.session_context import reset_session_vars
+
+    reset_session_vars()
+    for key in _SESSION_ENV_KEYS:
+        os.environ.pop(key, None)
+    yield
+    reset_session_vars()
+    for key in _SESSION_ENV_KEYS:
+        os.environ.pop(key, None)
 
 
 def _config(*, show_notice: bool) -> dict:

@@ -127,6 +127,37 @@ def test_adapter_for_source_resolves_secondary_profile_adapter(monkeypatch):
     ) is default_adapter
 
 
+def test_adapter_for_source_resolves_standalone_named_profile(monkeypatch):
+    """A dedicated named gateway keeps its adapter in ``self.adapters``."""
+    from gateway.run import GatewayRunner
+
+    _clear_auth_env(monkeypatch)
+    runner = object.__new__(GatewayRunner)
+    adapter = SimpleNamespace(send=AsyncMock())
+    runner.config = GatewayConfig(multiplex_profiles=False)
+    runner.adapters = {Platform.WECOM: adapter}
+    runner._profile_adapters = {}
+    runner._active_profile_name = lambda: "asuna"
+
+    own_source = SessionSource(
+        platform=Platform.WECOM,
+        user_id="haru",
+        chat_id="dm-chat",
+        chat_type="dm",
+        profile="asuna",
+    )
+    other_source = SessionSource(
+        platform=Platform.WECOM,
+        user_id="haru",
+        chat_id="dm-chat",
+        chat_type="dm",
+        profile="kairi",
+    )
+
+    assert runner._adapter_for_source(own_source) is adapter
+    assert runner._adapter_for_source(other_source) is None
+
+
 def test_secondary_allowlist_dm_behavior_ignores_unauthorized(monkeypatch):
     """Unauthorized-DM behavior must read the secondary adapter's dm_policy."""
     runner, _default_adapter, secondary_adapter = _make_multiplex_runner(monkeypatch)

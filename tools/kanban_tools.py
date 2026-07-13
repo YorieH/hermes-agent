@@ -36,7 +36,7 @@ from typing import Any, Optional
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
-from hermes_cli.config import cfg_get, load_config
+from hermes_cli.config import load_config
 
 logger = logging.getLogger(__name__)
 
@@ -79,17 +79,48 @@ def _check_kanban_mode() -> bool:
     return _profile_has_kanban_toolset()
 
 
+def _coordinator_review_target_from_env(board: Optional[str] = None) -> Optional[str]:
+    """Return the original task id when this worker is a coordinator review."""
+    env_tid = os.environ.get("HERMES_KANBAN_TASK")
+    if not env_tid:
+        return None
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            task = kb.get_task(conn, env_tid)
+        finally:
+            conn.close()
+    except Exception:
+        return None
+    if not task:
+        return None
+    key = (task.idempotency_key or "").strip()
+    if not key.startswith("coordinator-review:"):
+        return None
+    parts = key.split(":")
+    if len(parts) < 3 or not parts[1]:
+        return None
+    profile = (os.environ.get("HERMES_PROFILE") or "").strip().casefold()
+    assignee = (task.assignee or "").strip().casefold()
+    if profile and assignee and profile != assignee:
+        return None
+    return parts[1]
+
+
 def _check_kanban_orchestrator_mode() -> bool:
     """Board-routing tools (kanban_list, kanban_unblock) are intentionally
     hidden from task workers.
 
     Dispatcher-spawned workers should close their own task via the
     lifecycle tools (complete/block/heartbeat), not enumerate or unblock
-    board state. Profiles that explicitly opt into the kanban toolset
-    and are NOT scoped to a single task are the orchestrator surface.
+    board state. Coordinator-review workers are the narrow exception:
+    they may inspect the board and unblock the original review-required
+    task tied to their idempotency key. Profiles that explicitly opt into
+    the kanban toolset and are NOT scoped to a single task are the general
+    orchestrator surface.
     """
     if os.environ.get("HERMES_KANBAN_TASK"):
-        return False
+        return _coordinator_review_target_from_env() is not None
     return _profile_has_kanban_toolset()
 
 
@@ -132,7 +163,9 @@ def _stamp_worker_session_metadata(
     return stamped
 
 
-def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
+def _enforce_worker_task_ownership(
+    tid: str, *, board: Optional[str] = None
+) -> Optional[str]:
     """Reject worker-driven destructive calls on foreign task IDs.
 
     A process spawned by the dispatcher has ``HERMES_KANBAN_TASK`` set
@@ -156,6 +189,9 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
         # Orchestrator or CLI context — no task-scope restriction.
         return None
     if tid != env_tid:
+        target_tid = _coordinator_review_target_from_env(board=board)
+        if target_tid and tid == target_tid:
+            return None
         return tool_error(
             f"worker is scoped to task {env_tid}; refusing to mutate "
             f"{tid}. Use kanban_comment to hand off information to other "
@@ -315,7 +351,9 @@ def _parse_bool_arg(args: dict, name: str, *, default: bool = False):
     return default, f"{name} must be a boolean or 'true'/'false'"
 
 
-def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
+def _require_orchestrator_tool(
+    tool_name: str, *, board: Optional[str] = None
+) -> Optional[str]:
     """Belt-and-suspenders runtime guard for orchestrator-only handlers.
 
     The check_fn (`_check_kanban_orchestrator_mode`) keeps these tools
@@ -325,6 +363,8 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
     silently mutating board state from a worker context.
     """
     if os.environ.get("HERMES_KANBAN_TASK"):
+        if _coordinator_review_target_from_env(board=board) is not None:
+            return None
         return tool_error(
             f"{tool_name} is orchestrator-only; dispatcher-spawned workers "
             "must use kanban_complete, kanban_block, kanban_heartbeat, or "
@@ -442,7 +482,8 @@ def _handle_show(args: dict, **kw) -> str:
 
 def _handle_list(args: dict, **kw) -> str:
     """List task summaries with the same core filters as the CLI."""
-    guard = _require_orchestrator_tool("kanban_list")
+    board = args.get("board")
+    guard = _require_orchestrator_tool("kanban_list", board=board)
     if guard:
         return guard
     assignee = args.get("assignee")
@@ -462,7 +503,6 @@ def _handle_list(args: dict, **kw) -> str:
         return tool_error("limit must be >= 1")
     if limit > KANBAN_LIST_MAX_LIMIT:
         return tool_error(f"limit must be <= {KANBAN_LIST_MAX_LIMIT}")
-    board = args.get("board")
     try:
         kb, conn = _connect(board=board)
         try:
@@ -662,7 +702,15 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
             run = kb.latest_run(conn, tid)
-            return _ok(task_id=tid, run_id=run.id if run else None)
+            return _ok(
+                task_id=tid,
+                run_id=run.id if run else None,
+                terminal=True,
+                instruction=(
+                    "Task completion is recorded. Stop now: make no further "
+                    "tool calls or file changes and return your final response."
+                ),
+            )
         finally:
             conn.close()
     except ValueError as e:
@@ -740,6 +788,11 @@ def _handle_block(args: dict, **kw) -> str:
                 run_id=run.id if run else None,
                 status=landed.status if landed else "blocked",
                 block_kind=kind,
+                terminal=True,
+                instruction=(
+                    "Task block is recorded. Stop now: make no further tool "
+                    "calls or file changes and return your final response."
+                ),
             )
         finally:
             conn.close()
@@ -996,78 +1049,34 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     kanban_create that the agent is mid-conversation about.
     """
     try:
-        cfg = load_config()
-        if not cfg_get(cfg, "kanban", "auto_subscribe_on_create", default=True):
-            return False
-    except Exception:
-        # If config can't load we still default to True — this is the
-        # user-friendly behaviour that mirrors the pre-gate implementation.
-        pass
+        from hermes_cli.kanban_notify import maybe_auto_subscribe_task
 
-    platform = ""
-    chat_id = ""
-    try:
-        from gateway.session_context import get_session_env
-        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
-        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
-        if not platform or not chat_id:
-            # TUI / desktop fallback: platform/chat_id ContextVars are
-            # cleared for TUI sessions, but the parent process exports
-            # HERMES_SESSION_KEY into the subprocess env. Treat that
-            # as a "tui" subscription so the TUI notification poller
-            # (tui_gateway/server.py) can pick it up.
-            #
-            # HERMES_SESSION_ID is intentionally NOT a fallback here:
-            # it is set by ACP / the agent subprocess for telemetry
-            # regardless of whether the parent is a TUI or a CLI, so
-            # treating it as a notification target would auto-subscribe
-            # every CLI invocation, which is exactly the over-eager
-            # behaviour that got #19718 reverted upstream. The TUI
-            # poller keys on HERMES_SESSION_KEY.
-            session_key = (
-                get_session_env("HERMES_SESSION_KEY", "")
-                or os.environ.get("HERMES_SESSION_KEY", "")
-            )
-            if not session_key:
-                return False  # CLI / cron / test — no persistent channel
-            platform = "tui"
-            chat_id = session_key
-        thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
-        user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
-        notifier_profile = (
-            get_session_env("HERMES_SESSION_PROFILE", "")
-            or os.environ.get("HERMES_PROFILE")
+        return maybe_auto_subscribe_task(
+            conn,
+            task_id,
+            notifier_profile=(
+                os.environ.get("HERMES_KANBAN_NOTIFIER_PROFILE")
+                or os.environ.get("HERMES_PROFILE")
+                or None
+            ),
         )
-
-        # Lazy-import to keep the module-level dependency light
-        from hermes_cli import kanban_db as _kb
-        _kb.add_notify_sub(
-            conn, task_id=task_id,
-            platform=platform, chat_id=chat_id,
-            thread_id=thread_id, user_id=user_id,
-            notifier_profile=notifier_profile,
-        )
-        return True
     except Exception as _exc:
-        logger.warning(
-            "_maybe_auto_subscribe failed: %r (platform=%r key_set=%r)",
-            _exc, platform, bool(chat_id),
-        )
+        logger.warning("_maybe_auto_subscribe failed: %r", _exc)
         return False
 
 
 def _handle_unblock(args: dict, **kw) -> str:
     """Transition a blocked task back to ready."""
-    guard = _require_orchestrator_tool("kanban_unblock")
+    board = args.get("board")
+    guard = _require_orchestrator_tool("kanban_unblock", board=board)
     if guard:
         return guard
     tid = args.get("task_id")
     if not tid:
         return tool_error("task_id is required")
-    ownership_err = _enforce_worker_task_ownership(str(tid))
+    ownership_err = _enforce_worker_task_ownership(str(tid), board=board)
     if ownership_err:
         return ownership_err
-    board = args.get("board")
     try:
         kb, conn = _connect(board=board)
         try:

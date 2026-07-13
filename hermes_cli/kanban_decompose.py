@@ -177,12 +177,26 @@ def _load_config() -> dict:
         return {}
 
 
-def _resolve_orchestrator_profile(cfg: dict) -> str:
+def _resolve_orchestrator_profile(cfg: dict, *, task=None) -> str:
     """Resolve which profile owns the root/orchestration task after fan-out.
 
-    Falls back to the active default profile when ``kanban.orchestrator_profile``
-    is unset, so a task is never stranded for lack of an orchestrator.
+    Prefer the task's explicit lead, then the profile that created it. This
+    keeps the contacted girl accountable instead of routing every workstream
+    through one global coordinator. Config and active-profile fallbacks keep
+    legacy/CLI-created tasks routable.
     """
+    for candidate in (
+        getattr(task, "assignee", None),
+        getattr(task, "created_by", None),
+    ):
+        candidate = str(candidate or "").strip()
+        if not candidate:
+            continue
+        try:
+            if profiles_mod.profile_exists(candidate):
+                return candidate
+        except Exception:
+            pass
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     explicit = (kanban_cfg.get("orchestrator_profile") or "").strip()
     if explicit:
@@ -291,7 +305,7 @@ def decompose_task(
         )
 
     cfg = _load_config()
-    orchestrator = _resolve_orchestrator_profile(cfg)
+    orchestrator = _resolve_orchestrator_profile(cfg, task=task)
     default_assignee = _resolve_default_assignee(cfg)
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     auto_promote = bool(kanban_cfg.get("auto_promote_children", True))

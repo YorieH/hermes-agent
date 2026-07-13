@@ -62,6 +62,7 @@ from agent.retry_utils import (
     adaptive_rate_limit_backoff,
     is_zai_coding_overload_error,
     jittered_backoff,
+    structured_rate_limit_reset_wait,
     zai_coding_overload_retry_ceiling,
 )
 from agent.trajectory import has_incomplete_scratchpad
@@ -4162,6 +4163,11 @@ def run_conversation(
                                 _retry_after = min(float(_ra_raw), 600)
                             except (TypeError, ValueError):
                                 pass
+                    if _retry_after is None:
+                        _retry_after = structured_rate_limit_reset_wait(
+                            classified.error_context,
+                            now=time.time(),
+                        )
                 wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                 _backoff_policy = None
                 if (is_rate_limited or _is_zai_coding_overload) and not _retry_after:

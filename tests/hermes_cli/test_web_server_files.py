@@ -329,7 +329,27 @@ def test_hosted_policy_locks_to_opt_data(monkeypatch):
         _restore_app_state(prev_auth_required, prev_bound_host)
         client.close()
 
-    assert str(policy.locked_root) == "/opt/data"
+    assert str(policy.locked_root).replace("\\", "/").rstrip("/") == "/opt/data"
+    assert policy.can_change_path is False
+
+
+def test_hosted_named_profile_policy_locks_to_opt_data(monkeypatch):
+    """A hosted named profile still resolves to the shared /opt/data root."""
+    monkeypatch.delenv("HERMES_DASHBOARD_FILES_ROOT", raising=False)
+    monkeypatch.setenv("HERMES_HOME", "/opt/data/profiles/asuna")
+    client, prev_auth_required, prev_bound_host = _client_with_app_state()
+    try:
+        request = SimpleNamespace(
+            app=web_server.app,
+            client=SimpleNamespace(host="127.0.0.1"),
+            url=SimpleNamespace(hostname="127.0.0.1"),
+        )
+        policy = web_server._managed_files_policy(request, create_root=False)
+    finally:
+        _restore_app_state(prev_auth_required, prev_bound_host)
+        client.close()
+
+    assert policy.locked_root == web_server._HOSTED_MANAGED_FILES_ROOT
     assert policy.can_change_path is False
 
 

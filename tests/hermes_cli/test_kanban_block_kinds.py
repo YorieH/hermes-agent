@@ -139,10 +139,23 @@ def test_dependency_block_routes_to_todo(kanban_home: Path) -> None:
     """Dependency waits never enter the human 'blocked' bucket."""
     with kb.connect_closing() as conn:
         tid = _running_task(conn)
+        parent = kb.create_task(conn, title="unfinished parent")
+        kb.link_tasks(conn, parent_id=parent, child_id=tid)
         assert kb.block_task(conn, tid, reason="need X first", kind="dependency")
         t = kb.get_task(conn, tid)
         assert t.status == "todo"
         assert t.block_kind == "dependency"
+
+
+def test_dependency_block_without_nonterminal_parent_is_rejected(
+    kanban_home: Path,
+) -> None:
+    """A prose-only dependency must not create an immediate redispatch loop."""
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        with pytest.raises(ValueError, match="linked non-terminal parent"):
+            kb.block_task(conn, tid, reason="external thing", kind="dependency")
+        assert kb.get_task(conn, tid).status == "running"
 
 
 def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:

@@ -240,17 +240,23 @@ class TestUtilities:
         monkeypatch.delenv("SSH_TTY", raising=False)
         monkeypatch.delenv("DISPLAY", raising=False)
         monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
-        # Mock os.name and uname for non-macOS, non-Windows
-        monkeypatch.setattr(os, "name", "posix")
-        monkeypatch.setattr(os, "uname", lambda: type("", (), {"sysname": "Linux"})())
-        assert _can_open_browser() is False
+        # Mock os.name and uname for non-macOS, non-Windows. Keep the global
+        # os.name patch inside a context so pytest/pathlib is restored before
+        # report generation on Windows.
+        with monkeypatch.context() as m:
+            m.setattr(os, "name", "posix")
+            m.setattr(os, "uname", lambda: type("", (), {"sysname": "Linux"})(), raising=False)
+            result = _can_open_browser()
+        assert result is False
 
     def test_can_open_browser_true_with_display(self, monkeypatch):
         monkeypatch.delenv("SSH_CLIENT", raising=False)
         monkeypatch.delenv("SSH_TTY", raising=False)
         monkeypatch.setenv("DISPLAY", ":0")
-        monkeypatch.setattr(os, "name", "posix")
-        assert _can_open_browser() is True
+        with monkeypatch.context() as m:
+            m.setattr(os, "name", "posix")
+            result = _can_open_browser()
+        assert result is True
 
 
 class TestRedirectHandlerSshHint:

@@ -299,7 +299,7 @@ def test_dashboard_select_filters_use_sdk_value_change_handler():
 
     repo_root = Path(__file__).resolve().parents[2]
     bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
-    js = bundle.read_text()
+    js = bundle.read_text(encoding="utf-8")
 
     assert "function selectChangeHandler(setter)" in js
     assert "onValueChange: function (v)" in js
@@ -319,7 +319,7 @@ def test_dashboard_client_side_filtering_includes_tenant_filter():
 
     repo_root = Path(__file__).resolve().parents[2]
     bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
-    js = bundle.read_text()
+    js = bundle.read_text(encoding="utf-8")
 
     assert "if (tenantFilter && t.tenant !== tenantFilter) return false;" in js
     assert "[boardData, tenantFilter, assigneeFilter, search]" in js
@@ -335,7 +335,7 @@ def test_dashboard_initial_board_uses_backend_current_when_unpinned():
 
     repo_root = Path(__file__).resolve().parents[2]
     bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
-    js = bundle.read_text()
+    js = bundle.read_text(encoding="utf-8")
 
     assert 'useState(() => readSelectedBoard() || null)' in js
     assert "const storedBoard = readSelectedBoard();" in js
@@ -349,7 +349,7 @@ def test_dashboard_markdown_html_is_sanitized_before_render():
 
     repo_root = Path(__file__).resolve().parents[2]
     bundle = repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
-    js = bundle.read_text()
+    js = bundle.read_text(encoding="utf-8")
 
     assert "function sanitizeMarkdownHtml(html)" in js
     assert "MARKDOWN_ALLOWED_TAGS" in js
@@ -1137,7 +1137,7 @@ def test_dashboard_done_actions_prompt_for_completion_summary():
     repo_root = Path(__file__).resolve().parents[2]
     bundle = (
         repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
-    ).read_text()
+    ).read_text(encoding="utf-8")
 
     assert "withCompletionSummary" in bundle
     assert "Completion summary" in bundle
@@ -1155,7 +1155,7 @@ def test_dashboard_surfaces_ready_blocked_error_inline():
     repo_root = Path(__file__).resolve().parents[2]
     bundle = (
         repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
-    ).read_text()
+    ).read_text(encoding="utf-8")
 
     # Helper that strips ``"409: {\"detail\":\"…\"}"`` down to the
     # human-readable message before it lands in any banner.
@@ -1183,7 +1183,7 @@ def test_dashboard_dependency_selects_use_value_change_handler():
     repo_root = Path(__file__).resolve().parents[2]
     bundle = (
         repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
-    ).read_text()
+    ).read_text(encoding="utf-8")
 
     parent_select = (
         'value: newParent,\n'
@@ -1212,6 +1212,40 @@ def test_bulk_archive(client):
     ids = {t["id"] for col in board["columns"] for t in col["tasks"]}
     assert a["id"] not in ids
     assert b["id"] not in ids
+
+
+def test_bulk_archive_refuses_running_task(client):
+    a = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "active", "assignee": "worker"},
+    ).json()["task"]
+    b = client.post("/api/plugins/kanban/tasks", json={"title": "idle"}).json()["task"]
+    conn = kb.connect()
+    try:
+        claimed = kb.claim_task(conn, a["id"])
+        assert claimed is not None
+    finally:
+        conn.close()
+
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [a["id"], b["id"]], "archive": True},
+    )
+    assert r.status_code == 200
+    results = {entry["id"]: entry for entry in r.json()["results"]}
+    assert results[a["id"]]["ok"] is False
+    assert "archive refused" in results[a["id"]]["error"]
+    assert results[b["id"]]["ok"] is True
+
+    conn = kb.connect()
+    try:
+        active = kb.get_task(conn, a["id"])
+        idle = kb.get_task(conn, b["id"])
+        assert active.status == "running"
+        assert active.current_run_id is not None
+        assert idle.status == "archived"
+    finally:
+        conn.close()
 
 
 def test_bulk_reassign(client):
@@ -1400,8 +1434,8 @@ def test_patch_status_done_without_summary_still_works(client):
         conn.close()
 
 
-def test_patch_status_archive_closes_running_run(client):
-    """PATCH to archived while running must close the in-flight run."""
+def test_patch_status_archive_refuses_running_run(client):
+    """Dashboard archive must not hide an active worker."""
     r = client.post("/api/plugins/kanban/tasks", json={"title": "z", "assignee": "worker"})
     tid = r.json()["task"]["id"]
     from hermes_cli import kanban_db as kb
@@ -1416,13 +1450,13 @@ def test_patch_status_archive_closes_running_run(client):
         f"/api/plugins/kanban/tasks/{tid}",
         json={"status": "archived"},
     )
-    assert r.status_code == 200, r.text
+    assert r.status_code == 409, r.text
     conn = kb.connect()
     try:
         task = kb.get_task(conn, tid)
-        assert task.status == "archived"
-        assert task.current_run_id is None
-        assert kb.latest_run(conn, tid).outcome == "reclaimed"
+        assert task.status == "running"
+        assert task.current_run_id == open_run.id
+        assert kb.latest_run(conn, tid).ended_at is None
     finally:
         conn.close()
 
@@ -2303,7 +2337,7 @@ def test_board_endpoint_accepts_explicit_board_default_param(client):
 def test_dashboard_requests_default_board_explicitly():
     """Dashboard REST calls must include board=default instead of relying on server current board."""
     repo_root = Path(__file__).resolve().parents[2]
-    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text(encoding="utf-8")
 
     assert "SDK.fetchJSON(withBoard(`${API}/config`, board))" in dist
     assert "SDK.fetchJSON(withBoard(`${API}/boards`, board))" in dist
@@ -2314,7 +2348,7 @@ def test_dashboard_search_includes_body_and_result():
     """Client-side search must match body, result, latest_summary, and summary
     so full card contents are findable."""
     repo_root = Path(__file__).resolve().parents[2]
-    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text(encoding="utf-8")
 
     assert "t.body || \"\"" in dist
     assert "t.result || \"\"" in dist
@@ -2324,7 +2358,7 @@ def test_dashboard_search_includes_body_and_result():
 def test_dashboard_bulk_actions_include_reclaim_first():
     """Bulk action bar must expose reclaim_first checkbox and expanded status buttons."""
     repo_root = Path(__file__).resolve().parents[2]
-    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text(encoding="utf-8")
 
     assert "reclaim_first: reclaimFirst" in dist
     assert "hermes-kanban-bulk-reclaim-first" in dist
@@ -2336,7 +2370,7 @@ def test_dashboard_bulk_actions_include_reclaim_first():
 def test_dashboard_shift_click_range_selection_exists():
     """Shift-click must trigger range selection via toggleRange."""
     repo_root = Path(__file__).resolve().parents[2]
-    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text(encoding="utf-8")
 
     assert "function toggleRange" in dist or "const toggleRange =" in dist
     assert "props.toggleRange(t.id)" in dist or "props.toggleRange" in dist
@@ -2346,7 +2380,7 @@ def test_dashboard_shift_click_range_selection_exists():
 def test_dashboard_multi_move_bulk_exists():
     """Dragging a selected card with other selections must use /tasks/bulk."""
     repo_root = Path(__file__).resolve().parents[2]
-    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text(encoding="utf-8")
 
     assert "onMoveSelected" in dist
     assert "props.onMoveSelected" in dist
@@ -2356,8 +2390,8 @@ def test_dashboard_multi_move_bulk_exists():
 def test_dashboard_failed_card_highlight_class_exists():
     """Partial bulk failures must highlight failing cards."""
     repo_root = Path(__file__).resolve().parents[2]
-    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
-    css = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css").read_text()
+    js = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text(encoding="utf-8")
+    css = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "style.css").read_text(encoding="utf-8")
 
     assert "hermes-kanban-card--failed" in js
     assert "hermes-kanban-card--failed" in css

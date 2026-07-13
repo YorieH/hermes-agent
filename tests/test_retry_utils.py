@@ -5,7 +5,12 @@ import threading
 import agent.retry_utils as retry_utils
 from types import SimpleNamespace
 
-from agent.retry_utils import adaptive_rate_limit_backoff, is_zai_coding_overload_error, jittered_backoff
+from agent.retry_utils import (
+    adaptive_rate_limit_backoff,
+    is_zai_coding_overload_error,
+    jittered_backoff,
+    structured_rate_limit_reset_wait,
+)
 
 
 def test_backoff_is_exponential():
@@ -210,6 +215,19 @@ def test_non_zai_backoff_returns_default_wait():
     )
     assert wait == 12.0
     assert policy is None
+
+
+def test_structured_reset_wait_honors_short_future_window():
+    assert structured_rate_limit_reset_wait(
+        {"reset_at": 1041}, now=1000, grace_seconds=1
+    ) == 42
+
+
+def test_structured_reset_wait_rejects_stale_malformed_and_long_windows():
+    assert structured_rate_limit_reset_wait(None, now=1000) is None
+    assert structured_rate_limit_reset_wait({"reset_at": "nope"}, now=1000) is None
+    assert structured_rate_limit_reset_wait({"reset_at": 999}, now=1000) is None
+    assert structured_rate_limit_reset_wait({"reset_at": 2000}, now=1000) is None
 
 
 def test_zai_overload_retry_ceiling_exceeds_short_attempts():
