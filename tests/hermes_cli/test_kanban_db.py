@@ -453,6 +453,33 @@ def test_stale_claim_reclaimed(kanban_home, monkeypatch):
         assert killed == [signal.SIGTERM]
 
 
+def test_stale_reclaim_with_new_unfinished_parent_returns_to_todo(
+    kanban_home, monkeypatch,
+):
+    """A dependency linked mid-run must also survive automatic TTL reclaim."""
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="late review", assignee="reviewer")
+        child = kb.create_task(conn, title="active author", assignee="author")
+        host = _kb._claimer_id().split(":", 1)[0]
+        assert kb.claim_task(conn, child, claimer=f"{host}:worker") is not None
+        kb._set_worker_pid(conn, child, 12345)
+        kb.link_tasks(conn, parent, child)
+        assert kb.get_task(conn, child).status == "running"
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ? WHERE id = ?",
+            (int(time.time()) - 3600, child),
+        )
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        assert kb.release_stale_claims(
+            conn,
+            signal_fn=lambda _pid, _sig: None,
+        ) == 1
+        assert kb.get_task(conn, child).status == "todo"
+
+
 def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
     kanban_home, monkeypatch,
 ):

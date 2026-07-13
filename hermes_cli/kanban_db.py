@@ -3913,12 +3913,13 @@ def release_stale_claims(
             )
             continue
         with write_txn(conn):
+            requeue_status = _claim_release_status(conn, row["id"])
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (row["id"], row["claim_lock"], now),
+                (requeue_status, row["id"], row["claim_lock"], now),
             )
             if cur.rowcount != 1:
                 continue
@@ -3953,6 +3954,24 @@ def release_stale_claims(
     return reclaimed
 
 
+def _claim_release_status(conn: sqlite3.Connection, task_id: str) -> str:
+    """Return the dependency-safe queue status after releasing a claim.
+
+    A parent can be linked while its child is already running.  Releasing that
+    child's claim must not put it back in the ready queue until every parent is
+    terminal; otherwise board status and capacity diagnostics report runnable
+    work that the structural claim guard will only reject on the next tick.
+    """
+    undone = conn.execute(
+        "SELECT 1 FROM task_links l "
+        "JOIN tasks p ON p.id = l.parent_id "
+        "WHERE l.child_id = ? "
+        "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return "todo" if undone else "ready"
+
+
 def reclaim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -3960,7 +3979,7 @@ def reclaim_task(
     reason: Optional[str] = None,
     signal_fn=None,
 ) -> bool:
-    """Operator-driven reclaim: release the claim and reset to ``ready``.
+    """Operator-driven reclaim: release the claim to ``ready`` or ``todo``.
 
     Unlike :func:`release_stale_claims` which only acts on tasks whose
     ``claim_expires`` has passed, this function reclaims immediately
@@ -3985,12 +4004,13 @@ def reclaim_task(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
     with write_txn(conn):
+        requeue_status = _claim_release_status(conn, task_id)
         cur = conn.execute(
-            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
             "AND claim_lock IS ?",
-            (task_id, prev_lock),
+            (requeue_status, task_id, prev_lock),
         )
         if cur.rowcount != 1:
             return False

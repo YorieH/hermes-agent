@@ -4241,6 +4241,44 @@ def test_reclaim_task_returns_false_for_already_ready(kanban_home):
         conn.close()
 
 
+def test_reclaim_task_with_unfinished_parent_returns_to_todo(kanban_home, monkeypatch):
+    """A dependency linked mid-run must survive an operator reclaim."""
+    import hermes_cli.kanban_db as _kb
+
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="new dependency", assignee="reviewer")
+        child = kb.create_task(conn, title="running child", assignee="author")
+        claimed = kb.claim_task(conn, child, claimer="test:dependency-reclaim")
+        assert claimed is not None
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (12345, child))
+        conn.execute(
+            "UPDATE task_runs SET worker_pid=? WHERE id=(SELECT current_run_id FROM tasks WHERE id=?)",
+            (12345, child),
+        )
+        conn.commit()
+
+        # Linking while the child is running cannot demote it immediately.
+        kb.link_tasks(conn, parent, child)
+        assert kb.get_task(conn, child).status == "running"
+
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        assert kb.reclaim_task(
+            conn,
+            child,
+            reason="wait for newly linked review",
+            signal_fn=lambda _pid, _sig: None,
+        ) is True
+        assert kb.get_task(conn, child).status == "todo"
+        assert kb.claim_task(conn, child, claimer="test:must-not-run") is None
+
+        kb.complete_task(conn, parent, summary="review passed")
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "ready"
+    finally:
+        conn.close()
+
+
 def test_reassign_task_refuses_running_without_reclaim_first(kanban_home):
     """Without ``reclaim_first=True``, reassigning a running task is a
     no-op returning False (matches assign_task's RuntimeError via
