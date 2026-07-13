@@ -345,6 +345,56 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_complete_pauses_for_unacknowledged_coordinator_comment(
+    monkeypatch, worker_env
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        comment_id = kb.add_comment(
+            conn, worker_env, "sol", "Verify the exact candidate head"
+        )
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_COMMENT_CURSOR", str(comment_id - 1))
+    paused = json.loads(kt._handle_complete({"summary": "claimed complete"}))
+    assert "new coordinator comment" in paused["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_COMMENT_CURSOR", str(comment_id))
+    completed = json.loads(kt._handle_complete({"summary": "verified exact head"}))
+    assert completed["ok"] is True
+
+
+def test_complete_same_author_comment_still_requires_cursor_ack(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        comment_id = kb.add_comment(
+            conn, worker_env, "test-worker", "operator-authored update"
+        )
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_COMMENT_CURSOR", str(comment_id - 1))
+    paused = json.loads(kt._handle_complete({"summary": "done"}))
+    assert "new coordinator comment" in paused["error"]
+
+    monkeypatch.setenv("HERMES_KANBAN_COMMENT_CURSOR", str(comment_id))
+    completed = json.loads(kt._handle_complete({"summary": "done"}))
+    assert completed["ok"] is True
+
+
 def test_complete_metadata_round_trips_through_show(worker_env):
     """Structured completion metadata should be visible to downstream agents."""
     from tools import kanban_tools as kt

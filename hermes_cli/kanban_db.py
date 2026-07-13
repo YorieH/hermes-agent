@@ -4216,6 +4216,17 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class UnseenTaskCommentsError(RuntimeError):
+    """Raised when a worker tries to complete before reading new comments."""
+
+    def __init__(self, comments: list[sqlite3.Row]):
+        self.comments = list(comments)
+        super().__init__(
+            f"completion blocked by {len(self.comments)} unseen coordinator "
+            "comment(s)"
+        )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4225,6 +4236,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    expected_comment_cursor: Optional[int] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -4287,6 +4299,14 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        if expected_comment_cursor is not None:
+            unseen_comments = conn.execute(
+                "SELECT id, author, body, created_at FROM task_comments "
+                "WHERE task_id = ? AND id > ? ORDER BY id ASC",
+                (task_id, int(expected_comment_cursor)),
+            ).fetchall()
+            if unseen_comments:
+                raise UnseenTaskCommentsError(unseen_comments)
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -8828,6 +8848,8 @@ _WORKER_SESSION_ENV_KEYS = (
     "HERMES_SESSION_KEY",
     "HERMES_SESSION_MESSAGE_ID",
     "HERMES_KANBAN_NOTIFIER_PROFILE",
+    "HERMES_KANBAN_COMMENT_CURSOR",
+    "HERMES_KANBAN_COMMENT_DELIVERED_CURSOR",
 )
 
 
@@ -8852,6 +8874,13 @@ def _prepare_worker_session_env(
     try:
         conn = connect(board=board)
         try:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM task_comments WHERE task_id = ?",
+                (task.id,),
+            ).fetchone()
+            comment_cursor = int(row[0] or 0) if row else 0
+            env["HERMES_KANBAN_COMMENT_CURSOR"] = str(comment_cursor)
+            env["HERMES_KANBAN_COMMENT_DELIVERED_CURSOR"] = str(comment_cursor)
             subs = list_notify_subs(conn, task.id)
         finally:
             conn.close()

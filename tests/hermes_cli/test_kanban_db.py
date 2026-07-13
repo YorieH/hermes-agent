@@ -3487,6 +3487,40 @@ class TestSharedBoardPaths:
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
+        assert env["HERMES_KANBAN_COMMENT_CURSOR"] == "0"
+        assert env["HERMES_KANBAN_COMMENT_DELIVERED_CURSOR"] == "0"
+
+    def test_dispatcher_spawn_baselines_existing_task_comments(
+        self, tmp_path, monkeypatch
+    ):
+        default_home = tmp_path / ".hermes"
+        default_home.mkdir()
+        self._set_home(monkeypatch, tmp_path, default_home)
+        monkeypatch.setenv("HERMES_KANBAN_COMMENT_CURSOR", "999999")
+        monkeypatch.setenv("HERMES_KANBAN_COMMENT_DELIVERED_CURSOR", "999999")
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        with kb.connect() as conn:
+            tid = kb.create_task(conn, title="commented", assignee="coder")
+            first = kb.add_comment(conn, tid, "sol", "initial requirement")
+            latest = kb.add_comment(conn, tid, "sol", "latest requirement")
+            assert latest > first
+            task = kb.get_task(conn, tid)
+
+        captured = {}
+
+        class _FakePopen:
+            def __init__(self, cmd, **kwargs):
+                captured["env"] = kwargs.get("env", {})
+                self.pid = 4242
+
+        monkeypatch.setattr("subprocess.Popen", _FakePopen)
+        kb._default_spawn(task, str(workspace))
+
+        env = captured["env"]
+        assert env["HERMES_KANBAN_COMMENT_CURSOR"] == str(latest)
+        assert env["HERMES_KANBAN_COMMENT_DELIVERED_CURSOR"] == str(latest)
 
 
 # ---------------------------------------------------------------------------

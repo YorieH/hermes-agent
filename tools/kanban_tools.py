@@ -49,6 +49,20 @@ KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
 
 
+def _worker_comment_cursor(task_id: str) -> Optional[int]:
+    """Return the acknowledged comment cursor for this scoped worker."""
+    if os.environ.get("HERMES_KANBAN_TASK", "").strip() != task_id:
+        return None
+    raw = os.environ.get("HERMES_KANBAN_COMMENT_CURSOR")
+    if raw is None:
+        return None
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        # A malformed inherited cursor must not bypass new instructions.
+        return 0
+
+
 def _profile_has_kanban_toolset() -> bool:
     # Uses load_config() which has mtime-based caching, so this adds
     # negligible overhead. The check_fn results are further TTL-cached
@@ -675,6 +689,16 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    expected_comment_cursor=_worker_comment_cursor(tid),
+                )
+            except kb.UnseenTaskCommentsError as comment_err:
+                return tool_error(
+                    f"kanban_complete paused: {len(comment_err.comments)} new "
+                    f"coordinator comment(s) arrived after this run started. "
+                    f"Your task is still in-flight (no state change). Read the "
+                    f"coordinator update attached to this tool result, then call "
+                    f"kanban_heartbeat or kanban_comment to acknowledge it before "
+                    f"retrying kanban_complete."
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(

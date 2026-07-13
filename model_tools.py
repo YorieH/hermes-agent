@@ -1022,7 +1022,7 @@ def _emit_post_tool_call_hook(
         logger.debug("post_tool_call hook error: %s", _hook_err)
 
 
-def handle_function_call(
+def _handle_function_call_inner(
     function_name: str,
     function_args: Dict[str, Any],
     task_id: Optional[str] = None,
@@ -1350,6 +1350,58 @@ def handle_function_call(
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.exception(error_msg)
         return json.dumps({"error": _sanitize_tool_error(error_msg)}, ensure_ascii=False)
+
+
+def handle_function_call(
+    function_name: str,
+    function_args: Dict[str, Any],
+    task_id: Optional[str] = None,
+    tool_call_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
+    api_request_id: Optional[str] = None,
+    user_task: Optional[str] = None,
+    enabled_tools: Optional[List[str]] = None,
+    skip_pre_tool_call_hook: bool = False,
+    skip_tool_request_middleware: bool = False,
+    tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    enabled_toolsets: Optional[List[str]] = None,
+    disabled_toolsets: Optional[List[str]] = None,
+) -> str:
+    """Dispatch a tool call and surface live kanban coordinator comments.
+
+    The inner dispatcher retains every existing early-return path. This outer
+    seam is intentionally the final step so blocked, failed, bridged, and
+    successful tools all give a running worker the same update opportunity.
+    """
+    result = _handle_function_call_inner(
+        function_name=function_name,
+        function_args=function_args,
+        task_id=task_id,
+        tool_call_id=tool_call_id,
+        session_id=session_id,
+        turn_id=turn_id,
+        api_request_id=api_request_id,
+        user_task=user_task,
+        enabled_tools=enabled_tools,
+        skip_pre_tool_call_hook=skip_pre_tool_call_hook,
+        skip_tool_request_middleware=skip_tool_request_middleware,
+        tool_request_middleware_trace=tool_request_middleware_trace,
+        enabled_toolsets=enabled_toolsets,
+        disabled_toolsets=disabled_toolsets,
+    )
+
+    try:
+        from hermes_cli.kanban_live_comments import (
+            acknowledge_delivered_comments,
+            inject_pending_comments,
+        )
+
+        acknowledge_delivered_comments(function_name, result)
+        return inject_pending_comments(result, function_name=function_name)
+    except Exception as exc:
+        logger.debug("kanban comment injection failed: %s", exc)
+        return result
 
 
 # =============================================================================
