@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import io
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -109,6 +110,49 @@ def test_existing_binary_finds_windows_wrapper_in_staging(tmp_path, monkeypatch)
 
     assert install_mod._existing_binary("pyright-langserver") == str(wrapper)
     assert install_mod.detect_status("pyright") == "installed"
+
+
+def test_existing_binary_prefers_windows_wrapper_over_extensionless_npm_shim(
+    tmp_path, monkeypatch,
+):
+    """The POSIX npm shim is not executable by Windows CreateProcess."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from agent.lsp import install as install_mod
+
+    base = install_mod.hermes_lsp_bin_dir() / "typescript-language-server"
+    base.write_text("#!/bin/sh\n")
+    base.chmod(0o755)
+    wrapper = Path(str(base) + ".cmd")
+    wrapper.write_text("@echo off\n")
+    wrapper.chmod(0o755)
+
+    monkeypatch.setattr(install_mod, "_is_windows", lambda: True)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _name: None)
+
+    assert install_mod._existing_binary("typescript-language-server") == str(wrapper)
+
+
+def test_existing_binary_prefers_windows_wrapper_on_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from agent.lsp import install as install_mod
+
+    calls = []
+
+    def fake_which(name):
+        calls.append(name)
+        if name == "pyright-langserver.cmd":
+            return r"C:\npm\pyright-langserver.cmd"
+        if name == "pyright-langserver":
+            return r"C:\npm\pyright-langserver"
+        return None
+
+    monkeypatch.setattr(install_mod, "_is_windows", lambda: True)
+    monkeypatch.setattr(install_mod.shutil, "which", fake_which)
+
+    assert install_mod._existing_binary("pyright-langserver").endswith(".cmd")
+    assert calls[0] == "pyright-langserver.cmd"
 
 
 def test_install_pip_finds_windows_scripts_launcher(tmp_path, monkeypatch):

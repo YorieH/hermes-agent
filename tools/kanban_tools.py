@@ -639,18 +639,24 @@ def _handle_complete(args: dict, **kw) -> str:
             # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
             if task and task.goal_mode and _goal_judge_available():
-                verdict = "done"
-                reason = ""
+                # A reachable judge is an acceptance gate. Default to a
+                # rejection so an API-shape change or unexpected exception
+                # cannot silently turn an unverified task into ``done``.
+                verdict = "continue"
+                reason = "goal judge failed before returning a verdict"
                 try:
-                    verdict, reason, _ = judge_goal(
+                    verdict, reason, _, _ = judge_goal(
                         goal=f"{task.title}\n\n{task.body or ''}".strip(),
                         last_response=(summary or result or "").strip(),
                     )
                 except Exception as judge_exc:
-                    # Defensive: judge_goal swallows its own errors, but if
-                    # it ever raises, fail open rather than wedge the worker.
+                    # ``_goal_judge_available`` already established that the
+                    # gate is configured and reachable. Once it is active,
+                    # errors must fail closed; otherwise a return-shape bug or
+                    # provider failure bypasses the promised acceptance gate.
+                    reason = f"goal judge error: {type(judge_exc).__name__}"
                     logger.warning(
-                        "goal judge check failed, allowing completion: %s",
+                        "goal judge check failed, rejecting completion: %s",
                         judge_exc,
                         exc_info=True,
                     )

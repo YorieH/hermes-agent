@@ -494,6 +494,48 @@ class TestShellFileOpsHelpers:
             "C:/Users/alice/notes.txt"
         ) == "'/c/Users/alice/notes.txt'"
 
+    def test_expand_path_normalizes_msys_path_for_native_windows_tools(
+        self, monkeypatch, file_ops,
+    ):
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        assert file_ops._expand_path("/c/Users/alice/My Project") == (
+            "C:/Users/alice/My Project"
+        )
+
+    def test_native_tool_path_keeps_windows_drive_form(self, monkeypatch, file_ops):
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        assert file_ops._escape_native_tool_path_arg(
+            "/c/Users/alice/My Project"
+        ) == "'C:/Users/alice/My Project'"
+
+    def test_rg_search_receives_native_windows_path(self, monkeypatch, mock_env):
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        commands = []
+
+        def side_effect(command, **kwargs):
+            commands.append(command)
+            if command.startswith("test -e"):
+                return {"output": "exists\n", "returncode": 0}
+            return {"output": "", "returncode": 1}
+
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+        monkeypatch.setattr(ops, "_has_command", lambda name: name == "rg")
+
+        result = ops.search("needle", "/c/Users/alice/My Project")
+
+        assert result.error is None
+        rg_commands = [command for command in commands if "rg --line-number" in command]
+        assert rg_commands
+        assert "'C:/Users/alice/My Project'" in rg_commands[0]
+        assert "'/c/Users/alice/My Project'" not in rg_commands[0]
+
     def test_read_file_uses_bash_safe_windows_paths(self, mock_env, monkeypatch):
         import tools.environments.local as local_mod
 

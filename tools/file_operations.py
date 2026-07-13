@@ -929,6 +929,15 @@ class ShellFileOperations(FileOperations):
         """
         if not path:
             return path
+
+        # Tool calls frequently inherit Git Bash/MSYS paths (``/c/...``),
+        # while native Windows executables such as rg.exe require a drive
+        # path when MSYS argument conversion is intentionally disabled.
+        # Normalize once at the boundary; shell-only operations translate it
+        # back through ``_escape_shell_arg`` as needed.
+        from tools.environments import local as local_env
+        if local_env._IS_WINDOWS:
+            path = local_env._msys_to_windows_path(path).replace("\\", "/")
         
         # Handle ~ and ~user
         if path.startswith('~'):
@@ -956,6 +965,19 @@ class ShellFileOperations(FileOperations):
                         return user_home + suffix
         
         return path
+
+    def _escape_native_tool_path_arg(self, path: str) -> str:
+        """Quote a path for a native executable launched from Git Bash.
+
+        Hermes disables MSYS automatic argv conversion to prevent unrelated
+        argument corruption. Native tools must therefore receive ``C:/...``
+        rather than ``/c/...`` on Windows.
+        """
+        from tools.environments import local as local_env
+
+        if local_env._IS_WINDOWS:
+            path = local_env._msys_to_windows_path(path).replace("\\", "/")
+        return "'" + path.replace("'", "'\"'\"'") + "'"
     
     def _escape_shell_arg(self, arg: str) -> str:
         """Escape a string for safe use in shell commands.
@@ -2213,7 +2235,7 @@ class ShellFileOperations(FileOperations):
         # Try mtime-sorted first (rg 13+); fall back to unsorted if not supported.
         cmd_sorted = (
             f"rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)} "
-            f"{self._escape_shell_arg(path)} 2>/dev/null "
+            f"{self._escape_native_tool_path_arg(path)} 2>/dev/null "
             f"| head -n {fetch_limit}"
         )
         result = self._exec(cmd_sorted, timeout=60)
@@ -2224,7 +2246,7 @@ class ShellFileOperations(FileOperations):
             # --sortr may have failed on older rg; retry without it.
             cmd_plain = (
                 f"rg --files -g {self._escape_shell_arg(glob_pattern)} "
-                f"{self._escape_shell_arg(path)} 2>/dev/null "
+                f"{self._escape_native_tool_path_arg(path)} 2>/dev/null "
                 f"| head -n {fetch_limit}"
             )
             result = self._exec(cmd_plain, timeout=60)
@@ -2280,7 +2302,7 @@ class ShellFileOperations(FileOperations):
         
         # Add pattern and path
         cmd_parts.append(self._escape_shell_arg(pattern))
-        cmd_parts.append(self._escape_shell_arg(path))
+        cmd_parts.append(self._escape_native_tool_path_arg(path))
         
         # Fetch extra rows so we can report the true total before slicing.
         # For context mode, rg emits separator lines ("--") between groups,

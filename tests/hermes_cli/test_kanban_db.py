@@ -1639,6 +1639,24 @@ def test_empty_comment_rejected(kanban_home):
             kb.add_comment(conn, t, "user", "")
 
 
+@pytest.mark.parametrize(
+    "control",
+    ["\x00", "\x07", "\x0b", "\x0c", "\r", "\x1f", "\x7f"],
+)
+def test_comment_control_characters_rejected(kanban_home, control):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x")
+        with pytest.raises(ValueError, match="unsupported control characters"):
+            kb.add_comment(conn, t, "user", f"before{control}after")
+
+
+def test_comment_allows_newlines_and_tabs(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x")
+        kb.add_comment(conn, t, "user", "line one\n\tline two")
+        assert kb.list_comments(conn, t)[0].body == "line one\n\tline two"
+
+
 def test_events_capture_lifecycle(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")

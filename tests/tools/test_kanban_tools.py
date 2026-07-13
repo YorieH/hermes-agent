@@ -683,7 +683,7 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     # Mock the judge to reject the completion. The gate only runs when a
     # judge is reachable, so force the availability probe True as well.
     def mock_judge_goal(goal, last_response, *, timeout=30.0, subgoals=None):
-        return "continue", "missing verification evidence", False
+        return "continue", "missing verification evidence", False, None
 
     monkeypatch.setattr("tools.kanban_tools.judge_goal", mock_judge_goal)
     monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
@@ -803,6 +803,72 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", goal_task_id)
     return goal_task_id
+
+
+@pytest.mark.parametrize("verdict", ["continue", "wait", "skipped"])
+def test_complete_goal_mode_rejects_every_nondone_verdict(
+    monkeypatch, tmp_path, verdict,
+):
+    """A reachable judge's non-done verdict must keep the card running."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    wait_directive = {"seconds": 1} if verdict == "wait" else None
+    monkeypatch.setattr(
+        "tools.kanban_tools.judge_goal",
+        lambda *args, **kwargs: (
+            verdict,
+            f"judge said {verdict}",
+            False,
+            wait_directive,
+        ),
+    )
+    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
+
+    result = json.loads(kt._handle_complete({"summary": "claimed complete"}))
+    assert "Goal completion rejected by judge" in result["error"]
+    assert f"judge said {verdict}" in result["error"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "running"
+
+
+def test_complete_goal_mode_rejects_reachable_judge_exception(monkeypatch, tmp_path):
+    """A configured judge exception must not fail open to completion."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+
+    def broken_judge(*args, **kwargs):
+        raise RuntimeError("simulated provider failure")
+
+    monkeypatch.setattr("tools.kanban_tools.judge_goal", broken_judge)
+    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
+
+    result = json.loads(kt._handle_complete({"summary": "claimed complete"}))
+    assert "Goal completion rejected by judge" in result["error"]
+    assert "RuntimeError" in result["error"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "running"
+
+
+def test_complete_goal_mode_accepts_reachable_done_verdict(monkeypatch, tmp_path):
+    """The corrected four-field judge contract still permits verified work."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "tools.kanban_tools.judge_goal",
+        lambda *args, **kwargs: ("done", "verified", False, None),
+    )
+    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
+
+    result = json.loads(kt._handle_complete({"summary": "verified evidence"}))
+    assert result.get("ok") is True
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "done"
 
 
 def test_block_goal_mode_rejects_missing_kind(monkeypatch, tmp_path):

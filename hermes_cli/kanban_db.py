@@ -3116,6 +3116,13 @@ def add_comment(
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
+    # Durable coordinator instructions must never contain terminal/control
+    # bytes. PowerShell expands Markdown backtick sequences such as ``\a`` or
+    # ``\r`` inside interpolated strings; rejecting them makes the corruption
+    # visible instead of persisting ambiguous acceptance criteria. LF and TAB
+    # remain valid for normal formatted comments.
+    if re.search(r"[\x00-\x08\x0b\x0c\x0d\x0e-\x1f\x7f]", body):
+        raise ValueError("comment body contains unsupported control characters")
     now = int(time.time())
     with write_txn(conn):
         if not conn.execute(
