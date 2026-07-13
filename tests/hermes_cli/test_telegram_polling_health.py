@@ -1,7 +1,10 @@
 """Dashboard projection of the sanitized Telegram polling heartbeat."""
 
+import pytest
 
-def test_messaging_payload_surfaces_telegram_poll_health(monkeypatch):
+
+@pytest.mark.parametrize("poll_state", ["healthy", "stopped", "webhook"])
+def test_messaging_payload_surfaces_telegram_poll_health(monkeypatch, poll_state):
     from hermes_cli import web_server as ws
 
     entry = {
@@ -27,7 +30,7 @@ def test_messaging_payload_surfaces_telegram_poll_health(monkeypatch):
             "platforms": {
                 "telegram": {
                     "state": "connected",
-                    "poll_state": "healthy",
+                    "poll_state": poll_state,
                     "poll_last_success_at": "2026-07-14T00:00:25+00:00",
                     "poll_stale_after_seconds": 180.0,
                 }
@@ -36,7 +39,7 @@ def test_messaging_payload_surfaces_telegram_poll_health(monkeypatch):
         scoped=True,
     )
 
-    assert payload["poll_state"] == "healthy"
+    assert payload["poll_state"] == poll_state
     assert payload["poll_last_success_at"] == "2026-07-14T00:00:25+00:00"
     assert payload["poll_stale_after_seconds"] == 180.0
     assert "test-only-token" not in str(payload)

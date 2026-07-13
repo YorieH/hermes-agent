@@ -438,6 +438,7 @@ _TELEGRAM_LONG_POLL_TIMEOUT = 10.0
 _POLL_PROGRESS_STALE_FLOOR = 180.0
 _POLL_PROGRESS_REQUEST_BUDGETS = 4.0
 _POLL_PROGRESS_STATUS_INTERVAL = 30.0
+_MAX_STALE_POLL_GENERATIONS = 3
 
 
 def _poll_progress_stale_after(read_timeout: float) -> float:
@@ -468,18 +469,27 @@ class _PollingProgress:
         self.stale_after_seconds = float(stale_after_seconds)
         self._monotonic = monotonic
         self._wall_clock = wall_clock
+        self.generation = 0
+        self.active_generation: Optional[int] = None
         self.generation_started_monotonic: Optional[float] = None
         self.last_success_monotonic: Optional[float] = None
         self.last_success_at: Optional[str] = None
 
-    def begin_generation(self) -> float:
+    def begin_generation(self) -> int:
         """Start a new poller generation while retaining prior diagnostics."""
-        now = self._monotonic()
-        self.generation_started_monotonic = now
-        return now
+        self.generation += 1
+        self.active_generation = self.generation
+        self.generation_started_monotonic = self._monotonic()
+        return self.generation
 
-    def mark_success(self) -> float:
-        """Record one successfully completed long-poll request."""
+    def detach_generation(self) -> None:
+        """Reject completions from a poller that is stopping or replaced."""
+        self.active_generation = None
+
+    def mark_success(self, generation: Optional[int]) -> Optional[float]:
+        """Record a success only when it belongs to the active poller."""
+        if generation is None or generation != self.active_generation:
+            return None
         now = self._monotonic()
         self.last_success_monotonic = now
         self.last_success_at = self._wall_clock().astimezone(timezone.utc).isoformat()
@@ -505,7 +515,8 @@ class _PollingProgress:
 
 
 def _build_polling_progress_request(
-    on_poll_success: Callable[[], None],
+    on_poll_success: Callable[[Optional[int]], None],
+    get_poll_generation: Callable[[], Optional[int]],
     **request_kwargs: Any,
 ) -> Any:
     """Build the dedicated getUpdates request with a success-only callback.
@@ -530,6 +541,11 @@ def _build_polling_progress_request(
 
     class _PollingProgressHTTPXRequest(request_type):
         async def do_request(self, *args: Any, **kwargs: Any):
+            # Capture identity before awaiting the network. A previous PTB
+            # poll task may complete after stop/drain/start has already begun a
+            # replacement generation; that late response is not evidence that
+            # the replacement poller is healthy.
+            poll_generation = get_poll_generation()
             code, payload = await super().do_request(*args, **kwargs)
             request_data = kwargs.get("request_data")
             if request_data is None and len(args) >= 3:
@@ -541,7 +557,7 @@ def _build_polling_progress_request(
                     timeout_value = timeout_value.total_seconds()
                 is_long_poll = float(timeout_value or 0) > 0
                 if is_long_poll and 200 <= int(code) < 300:
-                    on_poll_success()
+                    on_poll_success(poll_generation)
             except Exception:
                 # Observability must never become part of the delivery path.
                 logger.debug("Telegram poll-progress callback failed", exc_info=True)
@@ -713,6 +729,7 @@ class TelegramAdapter(BasePlatformAdapter):
             _poll_progress_stale_after(20.0)
         )
         self._polling_progress_last_status_write: Optional[float] = None
+        self._polling_stale_generation_count: int = 0
         # Consecutive heartbeat probes that saw queued updates the running
         # poller is not consuming. get_me() can't see this — the send path is
         # healthy while the getUpdates consumer is wedged — so the heartbeat
@@ -814,7 +831,15 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _mark_disconnected(self) -> None:
         self._drop_delayed_deliveries = True
+        progress = self._get_polling_progress()
+        progress.detach_generation()
         super()._mark_disconnected()
+        self._write_runtime_status_safe(
+            "telegram-poll-stopped",
+            poll_state="stopped",
+            poll_last_success_at=progress.last_success_at,
+            poll_stale_after_seconds=progress.stale_after_seconds,
+        )
 
     def _set_fatal_error(self, code: str, message: str, *, retryable: bool) -> None:
         self._drop_delayed_deliveries = True
@@ -2066,7 +2091,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name, exc_info=True,
                 )
 
-    def _schedule_polling_recovery(self, error: Exception, *, reason: str) -> None:
+    def _schedule_polling_recovery(self, error: Exception, *, reason: str) -> bool:
         """Schedule polling recovery without failing gateway startup.
 
         A Telegram bootstrap failure (deleteWebhook / initial start_polling)
@@ -2075,13 +2100,13 @@ class TelegramAdapter(BasePlatformAdapter):
         ladder (``_handle_polling_network_error``) recovers in the background.
         """
         if self.has_fatal_error:
-            return
+            return False
         if self._polling_error_task and not self._polling_error_task.done():
             logger.debug(
                 "[%s] Telegram polling recovery already scheduled; ignoring %s: %s",
                 self.name, reason, error,
             )
-            return
+            return False
         self._send_path_degraded = True
         logger.warning(
             "[%s] Telegram polling degraded (%s); gateway stays alive and will retry. Error: %s",
@@ -2091,6 +2116,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_error_task = loop.create_task(self._handle_polling_network_error(error))
         self._background_tasks.add(self._polling_error_task)
         self._polling_error_task.add_done_callback(self._background_tasks.discard)
+        return True
 
     async def _delete_webhook_best_effort(self) -> bool:
         """Clear any stale webhook, but never fail polling on a network error.
@@ -2176,6 +2202,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if self.has_fatal_error:
             return
+        self._get_polling_progress().detach_generation()
 
         MAX_NETWORK_RETRIES = 10
         BASE_DELAY = 5
@@ -2399,10 +2426,39 @@ class TelegramAdapter(BasePlatformAdapter):
             poll_stale_after_seconds=progress.stale_after_seconds,
         )
 
-    def _record_polling_success(self) -> None:
-        """Record one completed idle-or-active long poll without payload data."""
+    def _get_polling_generation(self) -> Optional[int]:
+        """Return the identity of the currently active poller generation."""
+        return self._get_polling_progress().active_generation
+
+    def _mark_webhook_polling_state(self) -> None:
+        """Publish that Telegram is healthy without a local polling loop."""
         progress = self._get_polling_progress()
-        now = progress.mark_success()
+        progress.detach_generation()
+        self._write_runtime_status_safe(
+            "telegram-webhook-mode",
+            poll_state="webhook",
+            poll_last_success_at=progress.last_success_at,
+            poll_stale_after_seconds=progress.stale_after_seconds,
+        )
+
+    def _record_polling_success(self, poll_generation: Optional[int]) -> None:
+        """Record one completed idle-or-active long poll without payload data."""
+        if self._should_drop_delayed_delivery():
+            # disconnect() publishes poll_state=stopped before PTB drains the
+            # current request. A positive-timeout poll that wins that teardown
+            # race is teardown noise, not proof of a healthy active poller.
+            return
+        progress = self._get_polling_progress()
+        now = progress.mark_success(poll_generation)
+        if now is None:
+            # A request from the pre-recovery poller completed after a new
+            # generation began. Never let it reset the replacement poller's
+            # circuit breaker or repaint waiting/stale status as healthy.
+            return
+        # Only a real positive-timeout getUpdates completion from the current
+        # generation proves recovery. start_polling() returning, getMe(),
+        # webhook probes, and ordinary network retries cannot clear this.
+        self._polling_stale_generation_count = 0
         last_write = getattr(self, "_polling_progress_last_status_write", None)
         if last_write is not None and now - last_write < _POLL_PROGRESS_STATUS_INTERVAL:
             return
@@ -2415,7 +2471,7 @@ class TelegramAdapter(BasePlatformAdapter):
         )
 
     def _recover_stale_polling_if_needed(self) -> bool:
-        """Schedule exactly one existing-ladder recovery for a stale poller."""
+        """Recover one stale generation or escalate repeated silent starts."""
         if getattr(self, "_webhook_mode", False) or self.has_fatal_error:
             return False
         updater = getattr(self._app, "updater", None) if self._app else None
@@ -2435,19 +2491,55 @@ class TelegramAdapter(BasePlatformAdapter):
             poll_last_success_at=progress.last_success_at,
             poll_stale_after_seconds=progress.stale_after_seconds,
         )
+        stale_generations = getattr(self, "_polling_stale_generation_count", 0) + 1
+        previous = polling_error_task
+        if stale_generations >= _MAX_STALE_POLL_GENERATIONS:
+            message = (
+                "Telegram getUpdates repeatedly started without completing a "
+                "successful long-poll cycle. Restarting gateway."
+            )
+            logger.error(
+                "[%s] %s Consecutive silent generations: %d",
+                self.name,
+                message,
+                stale_generations,
+            )
+            self._set_fatal_error(
+                "telegram_polling_stale",
+                message,
+                retryable=True,
+            )
+            progress.detach_generation()
+            self._polling_stale_generation_count = stale_generations
+            loop = asyncio.get_running_loop()
+            notify_task = loop.create_task(self._notify_fatal_error())
+            self._polling_error_task = notify_task
+            background_tasks = getattr(self, "_background_tasks", None)
+            if background_tasks is None:
+                background_tasks = set()
+                self._background_tasks = background_tasks
+            background_tasks.add(notify_task)
+            notify_task.add_done_callback(background_tasks.discard)
+            return True
+
         logger.warning(
             "[%s] Telegram getUpdates made no successful progress for %.0fs "
-            "(stale threshold %.0fs); triggering bounded polling recovery",
+            "(stale threshold %.0fs; silent generation %d/%d); triggering "
+            "bounded polling recovery",
             self.name,
             age or 0.0,
             progress.stale_after_seconds,
+            stale_generations,
+            _MAX_STALE_POLL_GENERATIONS,
         )
-        previous = polling_error_task
-        self._schedule_polling_recovery(
+        scheduled = self._schedule_polling_recovery(
             TimeoutError("Telegram getUpdates progress heartbeat became stale"),
             reason="stale getUpdates progress",
         )
-        return getattr(self, "_polling_error_task", None) is not previous
+        if scheduled:
+            progress.detach_generation()
+            self._polling_stale_generation_count = stale_generations
+        return scheduled and getattr(self, "_polling_error_task", None) is not previous
 
     async def _probe_pending_updates(self, bot, probe_timeout: float) -> None:
         """Detect a wedged getUpdates consumer via pending_update_count.
@@ -2668,6 +2760,7 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _handle_polling_conflict(self, error: Exception) -> None:
         if self.has_fatal_error and self.fatal_error_code == "telegram_polling_conflict":
             return
+        self._get_polling_progress().detach_generation()
         # Transient 409 Conflict errors arise when the previous gateway process
         # has been killed (e.g. during `hermes update` or `--replace` handoffs)
         # but its long-poll connection hasn't yet expired on Telegram's servers.
@@ -3416,6 +3509,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 get_updates_request = _build_polling_progress_request(
                     self._record_polling_success,
+                    self._get_polling_generation,
                     **request_kwargs,
                     httpx_kwargs={
                         "transport": TelegramFallbackTransport(
@@ -3430,6 +3524,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 get_updates_request = _build_polling_progress_request(
                     self._record_polling_success,
+                    self._get_polling_generation,
                     **request_kwargs, proxy=proxy_url, httpx_kwargs=_with_limits()
                 )
             else:
@@ -3438,6 +3533,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 request = HTTPXRequest(**request_kwargs, httpx_kwargs=_with_limits())
                 get_updates_request = _build_polling_progress_request(
                     self._record_polling_success,
+                    self._get_polling_generation,
                     **request_kwargs, httpx_kwargs=_with_limits()
                 )
 
@@ -3570,6 +3666,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     drop_pending_updates=False,
                 )
                 self._webhook_mode = True
+                self._mark_webhook_polling_state()
                 logger.info(
                     "[%s] Webhook server listening on 0.0.0.0:%d%s",
                     self.name, webhook_port, webhook_path,

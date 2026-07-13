@@ -659,6 +659,12 @@ class TestGatewayRuntimeStatus:
         assert platform["poll_stale_after_seconds"] == 180.0
         assert {"token", "chat_id", "update_payload", "request_url"}.isdisjoint(platform)
 
+        status.write_runtime_status(platform="telegram", poll_state="stopped")
+        assert status.read_runtime_status()["platforms"]["telegram"]["poll_state"] == "stopped"
+
+        status.write_runtime_status(platform="telegram", poll_state="webhook")
+        assert status.read_runtime_status()["platforms"]["telegram"]["poll_state"] == "webhook"
+
     def test_write_runtime_status_explicit_none_clears_stale_fields(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
