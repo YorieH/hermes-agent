@@ -1134,6 +1134,8 @@ def _handle_function_call_inner(
                 task_id=task_id,
                 tool_call_id=tool_call_id,
                 session_id=session_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
                 user_task=user_task,
                 enabled_tools=enabled_tools,
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
@@ -1367,6 +1369,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    kanban_comment_state: Any = None,
 ) -> str:
     """Dispatch a tool call and surface live kanban coordinator comments.
 
@@ -1374,34 +1377,65 @@ def handle_function_call(
     seam is intentionally the final step so blocked, failed, bridged, and
     successful tools all give a running worker the same update opportunity.
     """
-    result = _handle_function_call_inner(
-        function_name=function_name,
-        function_args=function_args,
-        task_id=task_id,
-        tool_call_id=tool_call_id,
-        session_id=session_id,
-        turn_id=turn_id,
-        api_request_id=api_request_id,
-        user_task=user_task,
-        enabled_tools=enabled_tools,
-        skip_pre_tool_call_hook=skip_pre_tool_call_hook,
-        skip_tool_request_middleware=skip_tool_request_middleware,
-        tool_request_middleware_trace=tool_request_middleware_trace,
-        enabled_toolsets=enabled_toolsets,
-        disabled_toolsets=disabled_toolsets,
-    )
-
     try:
         from hermes_cli.kanban_live_comments import (
             acknowledge_delivered_comments,
+            bind_comment_delivery_state,
             inject_pending_comments,
         )
+    except Exception:
+        acknowledge_delivered_comments = None
+        bind_comment_delivery_state = None
+        inject_pending_comments = None
 
-        acknowledge_delivered_comments(function_name, result)
-        return inject_pending_comments(result, function_name=function_name)
+    def _dispatch() -> str:
+        return _handle_function_call_inner(
+            function_name=function_name,
+            function_args=function_args,
+            task_id=task_id,
+            tool_call_id=tool_call_id,
+            session_id=session_id,
+            turn_id=turn_id,
+            api_request_id=api_request_id,
+            user_task=user_task,
+            enabled_tools=enabled_tools,
+            skip_pre_tool_call_hook=skip_pre_tool_call_hook,
+            skip_tool_request_middleware=skip_tool_request_middleware,
+            tool_request_middleware_trace=tool_request_middleware_trace,
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+        )
+
+    if bind_comment_delivery_state is None:
+        return _dispatch()
+
+    try:
+        comment_scope = bind_comment_delivery_state(
+            kanban_comment_state,
+            session_id=session_id or "",
+        )
     except Exception as exc:
-        logger.debug("kanban comment injection failed: %s", exc)
-        return result
+        logger.debug("kanban comment scope setup failed: %s", exc)
+        return _dispatch()
+
+    with comment_scope:
+        result = _dispatch()
+        try:
+            acknowledge_delivered_comments(
+                function_name,
+                result,
+                turn_id=turn_id or "",
+                api_request_id=api_request_id or "",
+            )
+            return inject_pending_comments(
+                result,
+                function_name=function_name,
+                turn_id=turn_id or "",
+                api_request_id=api_request_id or "",
+            )
+        except Exception as exc:
+            logger.debug("kanban comment injection failed: %s", exc)
+            return result
 
 
 # =============================================================================

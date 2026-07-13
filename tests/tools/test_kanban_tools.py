@@ -374,6 +374,27 @@ def test_complete_pauses_for_unacknowledged_coordinator_comment(
     assert completed["ok"] is True
 
 
+@pytest.mark.parametrize("cursor", [None, "not-an-integer"])
+def test_complete_missing_or_malformed_scoped_cursor_fails_closed(
+    monkeypatch, worker_env, cursor
+):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        kb.add_comment(conn, worker_env, "sol", "Do not skip this requirement")
+
+    if cursor is None:
+        monkeypatch.delenv("HERMES_KANBAN_COMMENT_CURSOR", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_KANBAN_COMMENT_CURSOR", cursor)
+
+    paused = json.loads(kt._handle_complete({"summary": "claimed complete"}))
+    assert "new coordinator comment" in paused["error"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+
+
 def test_complete_same_author_comment_still_requires_cursor_ack(monkeypatch, worker_env):
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
@@ -1494,7 +1515,7 @@ def test_unblock_rejects_non_blocked_task(monkeypatch, worker_env):
     assert json.loads(out).get("error")
 
 
-def test_worker_lifecycle_through_tools(worker_env):
+def test_worker_lifecycle_through_tools(monkeypatch, worker_env):
     """Drive the full claim -> heartbeat -> comment -> complete lifecycle
     exclusively through the tools, then verify the DB state matches what
     the dispatcher/notifier expect."""
@@ -1508,10 +1529,14 @@ def test_worker_lifecycle_through_tools(worker_env):
     assert json.loads(kt._handle_heartbeat({"note": "warming up"}))["ok"]
 
     # 3. comment for a future peer
-    assert json.loads(kt._handle_comment({
+    comment = json.loads(kt._handle_comment({
         "task_id": worker_env,
         "body": "note: using stdlib sqlite3 bindings",
-    }))["ok"]
+    }))
+    assert comment["ok"]
+    # Direct handler calls bypass model_tools, whose successful-comment path
+    # normally acknowledges this exact self-created row for the worker.
+    monkeypatch.setenv("HERMES_KANBAN_COMMENT_CURSOR", str(comment["comment_id"]))
 
     # 4. spawn a child task for follow-up
     child_out = json.loads(kt._handle_create({

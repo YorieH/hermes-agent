@@ -51,16 +51,20 @@ KANBAN_LIST_MAX_LIMIT = 200
 
 def _worker_comment_cursor(task_id: str) -> Optional[int]:
     """Return the acknowledged comment cursor for this scoped worker."""
-    if os.environ.get("HERMES_KANBAN_TASK", "").strip() != task_id:
-        return None
-    raw = os.environ.get("HERMES_KANBAN_COMMENT_CURSOR")
-    if raw is None:
-        return None
     try:
-        return max(0, int(raw))
-    except (TypeError, ValueError):
-        # A malformed inherited cursor must not bypass new instructions.
-        return 0
+        from hermes_cli.kanban_live_comments import current_acknowledged_cursor
+
+        return current_acknowledged_cursor(task_id)
+    except Exception:
+        if os.environ.get("HERMES_KANBAN_TASK", "").strip() != task_id:
+            return None
+        # A missing or malformed cursor in a dispatcher-scoped worker must not
+        # disable the atomic unseen-comment completion gate.
+        raw = os.environ.get("HERMES_KANBAN_COMMENT_CURSOR")
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return 0
 
 
 def _profile_has_kanban_toolset() -> bool:

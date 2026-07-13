@@ -5,6 +5,7 @@ import os
 import sqlite3
 from unittest.mock import patch
 
+from hermes_cli.kanban_live_comments import build_comment_delivery_state
 from model_tools import handle_function_call
 
 
@@ -36,32 +37,43 @@ def _worker_env(monkeypatch, db_path, *, cursor="0"):
     monkeypatch.setenv("HERMES_PROFILE", "kurumi")
     monkeypatch.setenv("HERMES_KANBAN_COMMENT_CURSOR", cursor)
     monkeypatch.setenv("HERMES_KANBAN_COMMENT_DELIVERED_CURSOR", cursor)
+    return build_comment_delivery_state("owner-session")
+
+
+def _call(state, name, args, *, turn="turn-1", result=None, session="owner-session"):
+    dispatch = patch("model_tools.registry.dispatch", return_value=result or '{"ok":true}')
+    with dispatch:
+        return handle_function_call(
+            name,
+            args,
+            session_id=session,
+            turn_id=turn,
+            kanban_comment_state=state,
+        )
 
 
 def test_external_comment_repeats_until_lifecycle_ack(monkeypatch, tmp_path):
     path, conn = _comment_db(tmp_path)
     try:
         comment_id = _insert_comment(conn, "t_live", "sol", "New acceptance gate")
-        _worker_env(monkeypatch, path)
+        state = _worker_env(monkeypatch, path)
 
-        with patch("model_tools.registry.dispatch", return_value='{"ok":true}'):
-            first = json.loads(handle_function_call("web_search", {"q": "x"}))
-            second = json.loads(handle_function_call("web_search", {"q": "y"}))
+        first = json.loads(_call(state, "web_search", {"q": "x"}, turn="turn-1"))
+        second = json.loads(_call(state, "web_search", {"q": "y"}, turn="turn-2"))
 
-            for result in (first, second):
-                update = result["_kanban_coordinator_updates"]
-                assert update["comments"] == [{
-                    "id": comment_id,
-                    "author": "sol",
-                    "body": "New acceptance gate",
-                    "created_at": 123,
-                }]
-                assert "kanban_complete" in update["instruction"]
+        for result in (first, second):
+            update = result["_kanban_coordinator_updates"]
+            assert update["comments"] == [{
+                "id": comment_id,
+                "author": "sol",
+                "body": "New acceptance gate",
+                "created_at": 123,
+            }]
+            assert "kanban_complete" in update["instruction"]
 
-            assert os.environ["HERMES_KANBAN_COMMENT_CURSOR"] == "0"
-            assert int(
-                os.environ["HERMES_KANBAN_COMMENT_DELIVERED_CURSOR"]
-            ) == comment_id
+        assert state.acknowledged_cursor == 0
+        assert state.delivered_cursor == comment_id
+        assert os.environ["HERMES_KANBAN_COMMENT_CURSOR"] == "0"
     finally:
         conn.close()
 
@@ -70,15 +82,19 @@ def test_heartbeat_acknowledges_delivered_comment(monkeypatch, tmp_path):
     path, conn = _comment_db(tmp_path)
     try:
         comment_id = _insert_comment(conn, "t_live", "sol", "Use exact head")
-        _worker_env(monkeypatch, path)
+        state = _worker_env(monkeypatch, path)
 
-        with patch("model_tools.registry.dispatch", return_value='{"ok":true}'):
-            delivered = json.loads(handle_function_call("web_search", {"q": "x"}))
-            assert "_kanban_coordinator_updates" in delivered
-            acknowledged = json.loads(handle_function_call("kanban_heartbeat", {}))
+        delivered = json.loads(_call(
+            state, "web_search", {"q": "x"}, turn="turn-1"
+        ))
+        assert "_kanban_coordinator_updates" in delivered
+        acknowledged = json.loads(_call(
+            state, "kanban_heartbeat", {}, turn="turn-2"
+        ))
 
         assert acknowledged == {"ok": True}
-        assert int(os.environ["HERMES_KANBAN_COMMENT_CURSOR"]) == comment_id
+        assert state.acknowledged_cursor == comment_id
+        assert os.environ["HERMES_KANBAN_COMMENT_CURSOR"] == "0"
     finally:
         conn.close()
 
@@ -87,19 +103,20 @@ def test_failed_heartbeat_does_not_acknowledge(monkeypatch, tmp_path):
     path, conn = _comment_db(tmp_path)
     try:
         _insert_comment(conn, "t_live", "sol", "Use exact head")
-        _worker_env(monkeypatch, path)
+        state = _worker_env(monkeypatch, path)
 
-        with patch("model_tools.registry.dispatch", return_value='{"ok":true}'):
-            handle_function_call("web_search", {"q": "x"})
-        with patch(
-            "model_tools.registry.dispatch",
-            return_value='{"error":"heartbeat rejected"}',
-        ):
-            failed = json.loads(handle_function_call("kanban_heartbeat", {}))
+        _call(state, "web_search", {"q": "x"}, turn="turn-1")
+        failed = json.loads(_call(
+            state,
+            "kanban_heartbeat",
+            {},
+            turn="turn-2",
+            result='{"error":"heartbeat rejected"}',
+        ))
 
         assert failed["error"] == "heartbeat rejected"
         assert "_kanban_coordinator_updates" in failed
-        assert os.environ["HERMES_KANBAN_COMMENT_CURSOR"] == "0"
+        assert state.acknowledged_cursor == 0
     finally:
         conn.close()
 
@@ -108,14 +125,13 @@ def test_same_author_is_not_treated_as_worker_identity(monkeypatch, tmp_path):
     path, conn = _comment_db(tmp_path)
     try:
         comment_id = _insert_comment(conn, "t_live", "KURUMI", "operator update")
-        _worker_env(monkeypatch, path)
+        state = _worker_env(monkeypatch, path)
 
-        with patch("model_tools.registry.dispatch", return_value='{"ok":true}'):
-            result = json.loads(handle_function_call("web_search", {"q": "x"}))
+        result = json.loads(_call(state, "web_search", {"q": "x"}))
 
         comments = result["_kanban_coordinator_updates"]["comments"]
         assert [comment["id"] for comment in comments] == [comment_id]
-        assert os.environ["HERMES_KANBAN_COMMENT_CURSOR"] == "0"
+        assert state.acknowledged_cursor == 0
     finally:
         conn.close()
 
@@ -124,26 +140,141 @@ def test_exact_successful_comment_call_skips_only_its_own_row(monkeypatch, tmp_p
     path, conn = _comment_db(tmp_path)
     try:
         comment_id = _insert_comment(conn, "t_live", "kurumi", "my evidence")
-        _worker_env(monkeypatch, path)
+        state = _worker_env(monkeypatch, path)
         result_payload = json.dumps({
             "ok": True,
             "task_id": "t_live",
             "comment_id": comment_id,
         })
 
-        with patch("model_tools.registry.dispatch", return_value=result_payload):
-            result = json.loads(handle_function_call(
-                "kanban_comment", {"task_id": "t_live", "body": "my evidence"}
-            ))
+        result = json.loads(_call(
+            state,
+            "kanban_comment",
+            {"task_id": "t_live", "body": "my evidence"},
+            result=result_payload,
+        ))
 
         assert result == json.loads(result_payload)
-        assert int(os.environ["HERMES_KANBAN_COMMENT_CURSOR"]) == comment_id
+        assert state.acknowledged_cursor == comment_id
     finally:
         conn.close()
 
 
 def test_missing_comment_db_fails_open(monkeypatch, tmp_path):
-    _worker_env(monkeypatch, tmp_path / "missing.db")
-    with patch("model_tools.registry.dispatch", return_value='{"ok":true}'):
-        result = handle_function_call("web_search", {"q": "x"})
+    state = _worker_env(monkeypatch, tmp_path / "missing.db")
+    result = _call(state, "web_search", {"q": "x"})
     assert result == '{"ok":true}'
+
+
+def test_failed_comment_response_cannot_skip_matching_row(monkeypatch, tmp_path):
+    path, conn = _comment_db(tmp_path)
+    try:
+        comment_id = _insert_comment(conn, "t_live", "sol", "must remain visible")
+        state = _worker_env(monkeypatch, path)
+        rejected = json.dumps({
+            "ok": False,
+            "error": "rejected",
+            "task_id": "t_live",
+            "comment_id": comment_id,
+        })
+
+        result = json.loads(_call(
+            state,
+            "kanban_comment",
+            {"task_id": "t_live", "body": "failed"},
+            result=rejected,
+        ))
+
+        assert result["ok"] is False
+        assert [
+            item["id"]
+            for item in result["_kanban_coordinator_updates"]["comments"]
+        ] == [comment_id]
+        assert state.acknowledged_cursor == 0
+    finally:
+        conn.close()
+
+
+def test_owner_and_subagent_sessions_cannot_ack_each_other(monkeypatch, tmp_path):
+    path, conn = _comment_db(tmp_path)
+    try:
+        comment_id = _insert_comment(conn, "t_live", "sol", "owner-only update")
+        owner_state = _worker_env(monkeypatch, path)
+
+        owner_result = json.loads(_call(
+            owner_state, "web_search", {"q": "x"}, turn="owner-turn-1"
+        ))
+        assert "_kanban_coordinator_updates" in owner_result
+
+        # Passing the owner's state with a different session id must not bind
+        # it. This models a delegated AIAgent, which owns no comment state.
+        child_result = json.loads(_call(
+            owner_state,
+            "kanban_heartbeat",
+            {},
+            turn="child-turn-1",
+            session="child-session",
+        ))
+        assert child_result == {"ok": True}
+        assert owner_state.acknowledged_cursor == 0
+
+        repeated = json.loads(_call(
+            owner_state, "web_search", {"q": "y"}, turn="owner-turn-2"
+        ))
+        assert [
+            item["id"]
+            for item in repeated["_kanban_coordinator_updates"]["comments"]
+        ] == [comment_id]
+    finally:
+        conn.close()
+
+
+def test_same_turn_ack_cannot_consume_new_parallel_delivery(monkeypatch, tmp_path):
+    path, conn = _comment_db(tmp_path)
+    try:
+        comment_id = _insert_comment(conn, "t_live", "sol", "same-turn update")
+        state = _worker_env(monkeypatch, path)
+
+        delivered = json.loads(_call(
+            state, "web_search", {"q": "x"}, turn="shared-turn"
+        ))
+        assert "_kanban_coordinator_updates" in delivered
+        _call(state, "kanban_heartbeat", {}, turn="shared-turn")
+        assert state.acknowledged_cursor == 0
+
+        _call(state, "kanban_heartbeat", {}, turn="next-turn")
+        assert state.acknowledged_cursor == comment_id
+    finally:
+        conn.close()
+
+
+def test_self_comment_skips_only_own_row_among_external_updates(monkeypatch, tmp_path):
+    path, conn = _comment_db(tmp_path)
+    try:
+        first = _insert_comment(conn, "t_live", "sol", "before")
+        own = _insert_comment(conn, "t_live", "kurumi", "my evidence")
+        last = _insert_comment(conn, "t_live", "sol", "after")
+        state = _worker_env(monkeypatch, path)
+        response = json.dumps({
+            "ok": True,
+            "task_id": "t_live",
+            "comment_id": own,
+        })
+
+        result = json.loads(_call(
+            state,
+            "kanban_comment",
+            {"task_id": "t_live", "body": "my evidence"},
+            turn="turn-1",
+            result=response,
+        ))
+        assert [
+            item["id"]
+            for item in result["_kanban_coordinator_updates"]["comments"]
+        ] == [first, last]
+        assert state.acknowledged_cursor == 0
+
+        _call(state, "kanban_heartbeat", {}, turn="turn-2")
+        assert state.acknowledged_cursor == last
+    finally:
+        conn.close()

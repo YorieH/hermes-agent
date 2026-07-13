@@ -1266,6 +1266,26 @@ def init_agent(
     except Exception:
         os.environ["HERMES_SESSION_ID"] = agent.session_id
 
+    # Live kanban comments belong to the dispatcher-owned top-level agent.
+    # Delegate/background children share this process and its environment but
+    # have not seen the parent's tool results, so they must never inherit or
+    # acknowledge the parent's mutable comment cursor.
+    agent._kanban_comment_state = None
+    if (
+        os.environ.get("HERMES_KANBAN_TASK", "").strip()
+        and not parent_session_id
+        and agent.platform != "subagent"
+    ):
+        try:
+            from hermes_cli.kanban_live_comments import build_comment_delivery_state
+
+            agent._kanban_comment_state = build_comment_delivery_state(agent.session_id)
+        except Exception as exc:
+            logging.getLogger(__name__).debug(
+                "kanban comment state initialization failed: %s",
+                exc,
+            )
+
     # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
     hermes_home = get_hermes_home()
     agent.logs_dir = hermes_home / "sessions"

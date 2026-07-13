@@ -8871,6 +8871,12 @@ def _prepare_worker_session_env(
     if task.session_id:
         env["HERMES_SESSION_ID"] = task.session_id
 
+    # A scoped worker must always start with a conservative completion cursor.
+    # If the read-only baseline query fails, zero keeps every existing comment
+    # visible to the fail-closed completion gate instead of disabling it.
+    env["HERMES_KANBAN_COMMENT_CURSOR"] = "0"
+    env["HERMES_KANBAN_COMMENT_DELIVERED_CURSOR"] = "0"
+
     try:
         conn = connect(board=board)
         try:
