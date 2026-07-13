@@ -28,6 +28,7 @@ Design notes
 from __future__ import annotations
 
 import ctypes
+import json
 import locale
 import os
 import re
@@ -36,6 +37,8 @@ import shutil
 import subprocess
 import sys
 import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -899,6 +902,24 @@ def _spawn_detached(script_path: Path | None = None) -> int:
     """
     _assert_windows()
     argv, working_dir, env_overlay = _build_gateway_argv()
+    from hermes_cli.config import get_hermes_home
+
+    return _spawn_detached_argv(
+        argv,
+        working_dir=working_dir,
+        env_overlay=env_overlay,
+        hermes_home=Path(get_hermes_home()),
+    )
+
+
+def _spawn_detached_argv(
+    argv: list[str],
+    *,
+    working_dir: str,
+    env_overlay: dict[str, str],
+    hermes_home: Path,
+) -> int:
+    """Launch one already-built gateway argv as a detached process."""
 
     # Inherit PATH etc. from the current env, overlay our required vars.
     env = {**os.environ, **env_overlay}
@@ -918,9 +939,7 @@ def _spawn_detached(script_path: Path | None = None) -> int:
     # logging module writes to gateway.log through a FileHandler, so the
     # real gateway logs still land there — this just captures anything
     # that goes to print() or native stderr.
-    from hermes_cli.config import get_hermes_home
-
-    log_dir = Path(get_hermes_home()) / "logs"
+    log_dir = Path(hermes_home) / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     stray_log = log_dir / "gateway-stdio.log"
 
@@ -954,6 +973,34 @@ def _spawn_detached(script_path: Path | None = None) -> int:
                 stderr=log_fh,
             )
     return proc.pid
+
+
+def _spawn_detached_profile_gateway(profile: str, profile_path: Path) -> int:
+    """Start exactly one detached gateway for ``profile``.
+
+    Unlike :func:`_spawn_detached`, this helper does not depend on the
+    command's active ``HERMES_HOME``.  ``gateway restart --all-running`` uses
+    it to restore each profile that was running when the maintenance
+    transaction began.
+    """
+    from hermes_cli.gateway import _gateway_run_args_for_profile
+
+    profile_path = Path(profile_path)
+    argv, _working_dir, env_overlay = windowless_gateway_restart_spec(
+        _gateway_run_args_for_profile(profile)
+    )
+    env_overlay = {
+        **env_overlay,
+        "HERMES_HOME": str(profile_path),
+        "PYTHONIOENCODING": "utf-8",
+        "HERMES_GATEWAY_DETACHED": "1",
+    }
+    return _spawn_detached_argv(
+        argv,
+        working_dir=str(profile_path),
+        env_overlay=env_overlay,
+        hermes_home=profile_path,
+    )
 
 
 def _install_choice_from_env(name: str) -> bool | None:
@@ -1539,6 +1586,17 @@ def _windows_stop_drain_timeout() -> float:
     return max(1.0, min(configured, 30.0))
 
 
+def _windows_fleet_restart_drain_timeout() -> float:
+    """Honor a longer configured drain for the fleet-preserving restart."""
+    try:
+        from hermes_cli.gateway import _get_restart_drain_timeout
+
+        configured = float(_get_restart_drain_timeout() or 0.0)
+    except Exception:
+        configured = 0.0
+    return max(_windows_stop_drain_timeout(), configured)
+
+
 def _force_terminate_known_gateway_pids(pids: list[int]) -> int:
     """Force-kill known gateway PIDs without a broad process sweep."""
     try:
@@ -1674,6 +1732,284 @@ def _clear_gateway_maintenance_marker(path: Path | None = None) -> None:
         pass
     except Exception:
         pass
+
+
+def _write_profile_gateway_maintenance_marker(
+    profile_path: Path, reason: str
+) -> Path | None:
+    """Pause an external watchdog for one explicit profile home."""
+    try:
+        path = Path(profile_path) / "gateway_maintenance.lock"
+        path.write_text(f"{time.time():.3f} {reason}\n", encoding="utf-8")
+        return path
+    except Exception:
+        return None
+
+
+def _write_profile_planned_stop_marker(profile_path: Path, pid: int) -> str | None:
+    """Ask one profile to drain and return this marker's ownership token."""
+    try:
+        from gateway.status import _get_process_start_time
+        from utils import atomic_json_write
+
+        operation_id = uuid.uuid4().hex
+        record = {
+            "target_pid": int(pid),
+            "target_start_time": _get_process_start_time(int(pid)),
+            "stopper_pid": os.getpid(),
+            "operation_id": operation_id,
+            "written_at": datetime.now(timezone.utc).isoformat(),
+        }
+        atomic_json_write(
+            Path(profile_path) / ".gateway-planned-stop.json",
+            record,
+            indent=None,
+            separators=(",", ":"),
+        )
+        return operation_id
+    except Exception:
+        return None
+
+
+def _clear_profile_planned_stop_marker(
+    profile_path: Path, operation_id: str
+) -> bool:
+    """Remove only the planned-stop marker owned by this operation.
+
+    The old gateway normally consumes its marker during clean shutdown.  A
+    force-stopped gateway can leave it behind, but a concurrent maintenance
+    command may have replaced it with a newer marker.  The ownership token
+    prevents this transaction from deleting that newer request.
+    """
+    path = Path(profile_path) / ".gateway-planned-stop.json"
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return False
+    if not isinstance(record, dict) or record.get("operation_id") != operation_id:
+        return False
+
+    # Reading and then unlinking ``path`` would have a TOCTOU window: another
+    # command could atomically replace our marker between those operations.
+    # Atomically move whichever marker is current to a unique claim path, then
+    # verify ownership again.  If we claimed a replacement marker, restore it
+    # with a no-overwrite hard link unless an even newer marker already exists.
+    claim_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.claim")
+    try:
+        os.replace(path, claim_path)
+    except (FileNotFoundError, OSError):
+        return False
+    try:
+        claimed = json.loads(claim_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        claimed = None
+
+    if isinstance(claimed, dict) and claimed.get("operation_id") == operation_id:
+        try:
+            claim_path.unlink()
+            return True
+        except (FileNotFoundError, OSError):
+            return False
+
+    try:
+        os.link(claim_path, path)
+    except FileExistsError:
+        # A marker written after our claim is newer and stays authoritative.
+        pass
+    except OSError:
+        # Preserve the claimed marker under its unique name if this filesystem
+        # cannot provide the no-overwrite restore guarantee.
+        return False
+    try:
+        claim_path.unlink()
+    except (FileNotFoundError, OSError):
+        pass
+    return False
+
+
+def _wait_for_known_gateway_pids_absent(
+    pids: list[int], *, timeout_s: float, interval_s: float = 0.25
+) -> set[int]:
+    """Return the subset of ``pids`` still alive after a bounded wait."""
+    from gateway.status import _pid_exists
+
+    remaining = {int(pid) for pid in pids if int(pid) > 0}
+    deadline = time.monotonic() + max(timeout_s, 0.0)
+    while remaining and time.monotonic() < deadline:
+        remaining = {pid for pid in remaining if _pid_exists(pid)}
+        if remaining:
+            time.sleep(interval_s)
+    return {pid for pid in remaining if _pid_exists(pid)}
+
+
+def _get_profile_gateway_pid(profile_path: Path) -> int | None:
+    """Return the verified gateway PID for one explicit profile home."""
+    try:
+        from gateway.status import get_running_pid
+
+        return get_running_pid(
+            Path(profile_path) / "gateway.pid", cleanup_stale=False
+        )
+    except Exception:
+        return None
+
+
+def _wait_for_profile_gateways_ready(
+    profiles: dict[str, Path], *, timeout_s: float = 15.0, interval_s: float = 0.25
+) -> dict[str, int]:
+    """Wait until every named profile has a distinct verified gateway PID."""
+    ready: dict[str, int] = {}
+    deadline = time.monotonic() + max(timeout_s, interval_s)
+    while time.monotonic() < deadline:
+        ready = {}
+        seen_pids: set[int] = set()
+        for profile, profile_path in profiles.items():
+            pid = _get_profile_gateway_pid(profile_path)
+            if pid is None or pid <= 0 or pid in seen_pids:
+                continue
+            ready[profile] = pid
+            seen_pids.add(pid)
+        if len(ready) == len(profiles):
+            return ready
+        time.sleep(interval_s)
+    return ready
+
+
+def restart_running_profiles() -> None:
+    """Restart every profile gateway that is running at transaction start.
+
+    Discovery and profile mapping happen before any process is touched.  A
+    live but unmapped gateway makes the operation fail closed because killing
+    it would leave no safe, unique restore target.  Profile watchdogs are
+    paused for the whole drain/restore window so they cannot race the one
+    direct detached spawn performed for each profile.  This is the Windows
+    backend for ``gateway restart --all-running``; the older ``--all`` flag
+    intentionally retains its stop-all/start-active-profile contract.
+    """
+    _assert_windows()
+    from hermes_cli.gateway import (
+        find_gateway_pids,
+        find_profile_gateway_processes,
+    )
+
+    running_pids = list(dict.fromkeys(find_gateway_pids(all_profiles=True)))
+    if not running_pids:
+        print("No running profile gateways found; nothing to restart.")
+        return
+
+    by_pid = {proc.pid: proc for proc in find_profile_gateway_processes()}
+    unmapped = [pid for pid in running_pids if pid not in by_pid]
+    if unmapped:
+        joined = ", ".join(str(pid) for pid in unmapped)
+        raise RuntimeError(
+            "Refusing gateway restart --all-running before stopping anything: "
+            f"running gateway PID(s) {joined} have no verified profile mapping. "
+            "Run `hermes gateway list` and repair stale gateway.pid state first."
+        )
+
+    processes_by_profile = {}
+    for pid in running_pids:
+        proc = by_pid[pid]
+        if proc.profile in processes_by_profile:
+            raise RuntimeError(
+                "Refusing gateway restart --all-running before stopping anything: "
+                f"multiple running gateways map to profile {proc.profile!r}."
+            )
+        processes_by_profile[proc.profile] = proc
+    processes = [processes_by_profile[name] for name in sorted(processes_by_profile)]
+    profile_paths = {proc.profile: Path(proc.path) for proc in processes}
+    old_pids = [int(proc.pid) for proc in processes]
+
+    maintenance_markers: list[Path] = []
+    try:
+        # Establish every watchdog pause before asking any profile to stop.
+        for proc in processes:
+            marker = _write_profile_gateway_maintenance_marker(
+                Path(proc.path), "gateway restart --all-running"
+            )
+            if marker is None:
+                raise RuntimeError(
+                    "Could not pause the gateway watchdog for profile "
+                    f"{proc.profile!r}; no gateways were stopped."
+                )
+            maintenance_markers.append(marker)
+
+        names = ", ".join(proc.profile for proc in processes)
+        print(f"Restarting {len(processes)} running gateway profile(s): {names}")
+
+        planned_stop_owners: dict[str, str] = {}
+        marker_failures = []
+        for proc in processes:
+            operation_id = _write_profile_planned_stop_marker(
+                Path(proc.path), proc.pid
+            )
+            if operation_id:
+                planned_stop_owners[proc.profile] = operation_id
+            else:
+                marker_failures.append(proc.profile)
+        if marker_failures:
+            failed = ", ".join(marker_failures)
+            print(
+                "Warning: graceful drain marker failed for "
+                f"{failed}; bounded force-stop fallback will be used."
+            )
+
+        drain_timeout = _windows_fleet_restart_drain_timeout()
+        survivors = _wait_for_known_gateway_pids_absent(
+            old_pids, timeout_s=drain_timeout
+        )
+        if survivors:
+            _force_terminate_known_gateway_pids(sorted(survivors))
+            survivors = _wait_for_known_gateway_pids_absent(
+                sorted(survivors), timeout_s=10.0
+            )
+        if survivors:
+            joined = ", ".join(str(pid) for pid in sorted(survivors))
+            raise RuntimeError(
+                "Gateway process(es) still detected after bounded force stop: "
+                f"{joined}. Refusing to start duplicates."
+            )
+
+        # Clean force-stop leftovers before any replacement starts.  A clean
+        # old gateway already consumed its marker; a newer marker from another
+        # command has a different operation_id and is deliberately preserved.
+        for proc in processes:
+            operation_id = planned_stop_owners.get(proc.profile)
+            if operation_id:
+                _clear_profile_planned_stop_marker(Path(proc.path), operation_id)
+
+        spawn_errors: dict[str, str] = {}
+        for proc in processes:
+            # A watchdog that ignores the maintenance marker may already have
+            # restored this profile.  Treat that verified process as the one
+            # replacement and do not spawn a duplicate.
+            if _get_profile_gateway_pid(Path(proc.path)) is not None:
+                continue
+            try:
+                _spawn_detached_profile_gateway(proc.profile, Path(proc.path))
+            except Exception as exc:
+                spawn_errors[proc.profile] = str(exc)
+
+        ready = _wait_for_profile_gateways_ready(profile_paths, timeout_s=15.0)
+        missing = sorted(set(profile_paths) - set(ready))
+        if missing:
+            details = []
+            for profile in missing:
+                error = spawn_errors.get(profile)
+                details.append(f"{profile} ({error})" if error else profile)
+            raise RuntimeError(
+                "Gateway restart --all-running did not restore profile(s): "
+                + ", ".join(details)
+                + ". Check each profile's logs/gateway.log."
+            )
+
+        print(
+            f"Successfully restarted {len(ready)} gateway profile(s): "
+            + ", ".join(sorted(ready))
+        )
+    finally:
+        for marker in maintenance_markers:
+            _clear_gateway_maintenance_marker(marker)
 
 
 def restart() -> None:

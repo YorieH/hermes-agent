@@ -6880,7 +6880,24 @@ def _gateway_command_inner(args):
         service_available = False
         system = getattr(args, "system", False)
         restart_all = getattr(args, "all", False)
+        restart_all_running = getattr(args, "all_running", False)
         service_configured = False
+
+        if restart_all_running:
+            if not is_windows():
+                print_error(
+                    "`hermes gateway restart --all-running` is currently "
+                    "supported only on Windows."
+                )
+                sys.exit(1)
+            from hermes_cli import gateway_windows
+
+            try:
+                gateway_windows.restart_running_profiles()
+            except (OSError, RuntimeError) as exc:
+                print_error(str(exc))
+                sys.exit(1)
+            return
 
         # Phase 4: inside a container with s6, dispatch via the service
         # manager (s6-svc -t restarts the supervised process). ``--all``
@@ -6925,8 +6942,13 @@ def _gateway_command_inner(args):
                 print(f"✓ Stopped {total} gateway process(es) across all profiles")
             _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
 
-            # Start the current profile's service fresh
-            print("Starting gateway...")
+            # Historical contract: --all clears every profile gateway but
+            # starts only the active profile.  Say that explicitly so this is
+            # never confused with --all-running's fleet-preserving restart.
+            print(
+                "Starting only the active profile gateway "
+                "(use --all-running to restore every previously running profile)..."
+            )
             if supports_systemd_services() and (
                 get_systemd_unit_path(system=False).exists()
                 or get_systemd_unit_path(system=True).exists()

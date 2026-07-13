@@ -314,6 +314,27 @@ def test_gateway_run_force_flag_survives_parser_extraction():
     assert args.force is True
 
 
+def test_gateway_restart_all_running_parser_is_distinct_from_legacy_all():
+    from hermes_cli.subcommands.gateway import build_gateway_parser
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    build_gateway_parser(
+        subparsers,
+        cmd_gateway=lambda _args: None,
+        cmd_proxy=lambda _args: None,
+        cmd_gateway_enroll=lambda _args: None,
+    )
+
+    fleet = parser.parse_args(["gateway", "restart", "--all-running"])
+    legacy = parser.parse_args(["gateway", "restart", "--all"])
+
+    assert fleet.all_running is True and fleet.all is False
+    assert legacy.all is True and legacy.all_running is False
+    with pytest.raises(SystemExit):
+        parser.parse_args(["gateway", "restart", "--all", "--all-running"])
+
+
 def test_run_gateway_windows_foreground_keeps_ctrl_c_enabled(monkeypatch):
     calls = []
 
@@ -558,6 +579,128 @@ def test_gateway_restart_on_windows_preserves_failure_fallback(monkeypatch):
     gateway.gateway_command(args)
 
     assert calls == ["restart", "stop", "wait", "run"]
+
+
+def test_gateway_restart_all_running_on_windows_uses_multi_profile_backend(monkeypatch):
+    """Windows --all-running must use the fleet-preserving backend."""
+    import hermes_cli.gateway_windows as gateway_windows
+
+    calls = []
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+    monkeypatch.setattr(gateway, "is_macos", lambda: False)
+    monkeypatch.setattr(gateway, "is_windows", lambda: True)
+    monkeypatch.setattr(
+        gateway,
+        "_dispatch_all_via_service_manager_if_s6",
+        lambda _action: False,
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "restart_running_profiles",
+        lambda: calls.append("all-running"),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "restart",
+        lambda: pytest.fail("--all-running must not use the single-profile restart path"),
+    )
+    monkeypatch.setattr(
+        gateway,
+        "kill_gateway_processes",
+        lambda **_kwargs: pytest.fail(
+            "--all-running must not use the stop-all/start-current path"
+        ),
+    )
+
+    args = SimpleNamespace(
+        gateway_command="restart", system=False, all=False, all_running=True
+    )
+    gateway.gateway_command(args)
+
+    assert calls == ["all-running"]
+
+
+def test_gateway_restart_all_running_reports_preflight_failure_without_fallback(
+    monkeypatch, capsys
+):
+    import hermes_cli.gateway_windows as gateway_windows
+
+    def fail_preflight():
+        raise RuntimeError("unmapped PID 999")
+
+    monkeypatch.setattr(gateway, "is_windows", lambda: True)
+    monkeypatch.setattr(
+        gateway_windows,
+        "restart_running_profiles",
+        fail_preflight,
+    )
+    monkeypatch.setattr(
+        gateway,
+        "kill_gateway_processes",
+        lambda **_kwargs: pytest.fail("failed preflight must not stop gateways"),
+    )
+
+    args = SimpleNamespace(
+        gateway_command="restart", system=False, all=False, all_running=True
+    )
+    with pytest.raises(SystemExit) as exc_info:
+        gateway.gateway_command(args)
+
+    assert exc_info.value.code == 1
+    assert "unmapped PID 999" in capsys.readouterr().out
+
+
+def test_gateway_restart_legacy_all_keeps_stop_all_start_active_contract(
+    monkeypatch, capsys
+):
+    """Do not silently change the historical --all behavior used by scripts."""
+    import hermes_cli.gateway_windows as gateway_windows
+
+    calls = []
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+    monkeypatch.setattr(gateway, "is_macos", lambda: False)
+    monkeypatch.setattr(gateway, "is_windows", lambda: True)
+    monkeypatch.setattr(
+        gateway,
+        "_dispatch_all_via_service_manager_if_s6",
+        lambda _action: False,
+    )
+    monkeypatch.setattr(gateway_windows, "is_installed", lambda: False)
+    monkeypatch.setattr(
+        gateway_windows,
+        "stop",
+        lambda: pytest.fail("uninstalled active profile has no service stop"),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "restart_running_profiles",
+        lambda: pytest.fail("legacy --all must not select fleet preservation"),
+    )
+    monkeypatch.setattr(
+        gateway,
+        "kill_gateway_processes",
+        lambda **kwargs: calls.append(("kill", kwargs)) or 2,
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_wait_for_gateway_exit",
+        lambda **kwargs: calls.append(("wait", kwargs)),
+    )
+    monkeypatch.setattr(gateway_windows, "start", lambda: calls.append(("start", {})))
+
+    args = SimpleNamespace(
+        gateway_command="restart", system=False, all=True, all_running=False
+    )
+    gateway.gateway_command(args)
+
+    assert calls == [
+        ("kill", {"all_profiles": True}),
+        ("wait", {"timeout": 10.0, "force_after": 5.0}),
+        ("start", {}),
+    ]
+    out = capsys.readouterr().out
+    assert "Starting only the active profile gateway" in out
+    assert "use --all-running" in out
 
 
 def test_systemd_status_warns_when_linger_disabled(monkeypatch, tmp_path, capsys):

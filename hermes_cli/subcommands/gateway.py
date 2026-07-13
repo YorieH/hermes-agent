@@ -126,10 +126,16 @@ def build_gateway_parser(
         action="store_true",
         help="Target the Linux system-level gateway service",
     )
-    gateway_restart.add_argument(
+    gateway_restart_scope = gateway_restart.add_mutually_exclusive_group()
+    gateway_restart_scope.add_argument(
         "--all",
         action="store_true",
-        help="Kill ALL gateway processes across all profiles before restarting",
+        help="Stop all profile gateways, then start only the active profile",
+    )
+    gateway_restart_scope.add_argument(
+        "--all-running",
+        action="store_true",
+        help="On Windows, restart every profile gateway that is currently running",
     )
     _add_compat_platform_flag(gateway_restart)
 

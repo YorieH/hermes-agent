@@ -237,7 +237,8 @@ Options:
 
 | Option | Description |
 |--------|-------------|
-| `--all` | On `start` / `restart` / `stop`: act on **every profile's** gateway, not just the active `HERMES_HOME`. Useful if you run multiple profiles side-by-side and want to restart them all after `hermes update`. |
+| `--all` | On `restart`, stop gateways across all profiles and then start **only the active profile**; on `stop`, stop gateways across all profiles. On `start`, clear stale gateway processes across profiles before starting the active profile. This historical flag does not preserve which profiles were running. |
+| `--all-running` | On Windows `restart`, safely restart every profile gateway that was running when the command began. Hermes pauses per-profile watchdog recovery, drains the fleet, restores each unique profile once, and verifies every replacement. The operation fails before stopping anything if a live gateway cannot be mapped to a profile. |
 | `--no-supervise` | On `run`: inside the s6-overlay Docker image, opt out of auto-supervision and use pre-s6 foreground semantics — gateway runs as the container's main process with no auto-restart. No-op outside the s6 image. Equivalent to setting `HERMES_GATEWAY_NO_SUPERVISE=1`. |
 
 `hermes gateway enroll` accepts `--token`, `--connector-url`, `--gateway-id`, and `--wake-url`. It exchanges the enrollment token with the connector and writes the resulting `GATEWAY_RELAY_ID`, `GATEWAY_RELAY_SECRET`, `GATEWAY_RELAY_DELIVERY_KEY`, optional `GATEWAY_RELAY_URL`, and (when `--wake-url` is given) `GATEWAY_RELAY_WAKE_URL` values to the active profile's `.env`.

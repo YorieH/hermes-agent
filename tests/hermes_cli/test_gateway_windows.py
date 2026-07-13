@@ -1,5 +1,6 @@
 """Tests for hermes_cli.gateway_windows."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -964,3 +965,521 @@ def test_restart_clears_maintenance_marker_on_failure(monkeypatch, tmp_path):
         gateway_windows.restart()
 
     assert not marker.exists()
+
+
+def test_restart_running_profiles_restores_each_profile_once(monkeypatch, tmp_path, capsys):
+    """Multi-profile restart must not rely on watchdog resurrection."""
+    homes = {
+        "asuna": tmp_path / "profiles" / "asuna",
+        "kurumi": tmp_path / "profiles" / "kurumi",
+    }
+    for home in homes.values():
+        home.mkdir(parents=True)
+
+    processes = [
+        gateway.ProfileGatewayProcess("asuna", homes["asuna"], 101),
+        gateway.ProfileGatewayProcess("kurumi", homes["kurumi"], 202),
+    ]
+    events = []
+    ready_pids = {}
+
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(
+        gateway,
+        "find_gateway_pids",
+        lambda *, all_profiles=False: [101, 202] if all_profiles else [],
+    )
+    monkeypatch.setattr(gateway, "find_profile_gateway_processes", lambda: processes)
+    monkeypatch.setattr(
+        gateway_windows, "_windows_fleet_restart_drain_timeout", lambda: 7.0
+    )
+
+    def fake_planned_stop(home, pid):
+        # Every watchdog must be paused before the first stop request is sent.
+        assert all(
+            (profile_home / "gateway_maintenance.lock").exists()
+            for profile_home in homes.values()
+        )
+        events.append(("planned_stop", Path(home).name, pid))
+        return True
+
+    def fake_wait_absent(pids, *, timeout_s, interval_s=0.25):
+        events.append(("wait_absent", tuple(pids), timeout_s))
+        return set()
+
+    def fake_spawn(profile, home):
+        # The watchdog pause remains in force throughout restoration.
+        assert (Path(home) / "gateway_maintenance.lock").exists()
+        events.append(("spawn", profile, Path(home)))
+        ready_pids[profile] = {"asuna": 303, "kurumi": 404}[profile]
+        return ready_pids[profile]
+
+    monkeypatch.setattr(
+        gateway_windows, "_write_profile_planned_stop_marker", fake_planned_stop
+    )
+    monkeypatch.setattr(
+        gateway_windows, "_wait_for_known_gateway_pids_absent", fake_wait_absent
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_force_terminate_known_gateway_pids",
+        lambda _pids: pytest.fail("clean drains must not be force-killed"),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_get_profile_gateway_pid",
+        lambda home: ready_pids.get(Path(home).name),
+    )
+    monkeypatch.setattr(gateway_windows, "_spawn_detached_profile_gateway", fake_spawn)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_wait_for_profile_gateways_ready",
+        lambda profile_paths, timeout_s=15.0: dict(ready_pids),
+    )
+
+    gateway_windows.restart_running_profiles()
+
+    assert [event[1] for event in events if event[0] == "planned_stop"] == [
+        "asuna",
+        "kurumi",
+    ]
+    assert [event[1] for event in events if event[0] == "spawn"] == [
+        "asuna",
+        "kurumi",
+    ]
+    assert events.count(("wait_absent", (101, 202), 7.0)) == 1
+    assert not any(
+        (home / "gateway_maintenance.lock").exists() for home in homes.values()
+    )
+    out = capsys.readouterr().out
+    assert "Successfully restarted 2 gateway profile(s): asuna, kurumi" in out
+
+
+def test_restart_running_profiles_late_maintenance_failure_stops_nothing(
+    monkeypatch, tmp_path
+):
+    """A partial watchdog pause must roll back before any stop request."""
+    homes = {
+        "asuna": tmp_path / "profiles" / "asuna",
+        "kurumi": tmp_path / "profiles" / "kurumi",
+    }
+    for home in homes.values():
+        home.mkdir(parents=True)
+    processes = [
+        gateway.ProfileGatewayProcess("asuna", homes["asuna"], 101),
+        gateway.ProfileGatewayProcess("kurumi", homes["kurumi"], 202),
+    ]
+    original_write = gateway_windows._write_profile_gateway_maintenance_marker
+    writes = []
+
+    def fail_second_marker(home, reason):
+        writes.append(Path(home).name)
+        if len(writes) == 2:
+            return None
+        return original_write(home, reason)
+
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(
+        gateway,
+        "find_gateway_pids",
+        lambda *, all_profiles=False: [101, 202] if all_profiles else [],
+    )
+    monkeypatch.setattr(gateway, "find_profile_gateway_processes", lambda: processes)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_write_profile_gateway_maintenance_marker",
+        fail_second_marker,
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_write_profile_planned_stop_marker",
+        lambda *_args: pytest.fail("maintenance preflight must finish before stopping"),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_wait_for_known_gateway_pids_absent",
+        lambda *_args, **_kwargs: pytest.fail("no gateway should be drained"),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_force_terminate_known_gateway_pids",
+        lambda *_args: pytest.fail("no gateway should be force-stopped"),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_spawn_detached_profile_gateway",
+        lambda *_args: pytest.fail("no gateway should be spawned"),
+    )
+
+    with pytest.raises(RuntimeError, match="no gateways were stopped"):
+        gateway_windows.restart_running_profiles()
+
+    assert writes == ["asuna", "kurumi"]
+    assert not any(
+        (home / "gateway_maintenance.lock").exists() for home in homes.values()
+    )
+
+
+def test_restart_running_profiles_force_stops_only_snapshot_and_clears_before_spawn(
+    monkeypatch, tmp_path
+):
+    """Force fallback is PID-bounded and owned stop markers precede respawn."""
+    homes = {
+        "asuna": tmp_path / "profiles" / "asuna",
+        "kurumi": tmp_path / "profiles" / "kurumi",
+    }
+    for home in homes.values():
+        home.mkdir(parents=True)
+    processes = [
+        gateway.ProfileGatewayProcess("asuna", homes["asuna"], 101),
+        gateway.ProfileGatewayProcess("kurumi", homes["kurumi"], 202),
+    ]
+    events = []
+    ready_pids = {}
+    wait_count = 0
+    original_clear = gateway_windows._clear_profile_planned_stop_marker
+
+    def fake_wait_absent(pids, *, timeout_s, interval_s=0.25):
+        nonlocal wait_count
+        wait_count += 1
+        events.append(("wait_absent", tuple(pids), timeout_s))
+        return {202, 101} if wait_count == 1 else set()
+
+    def fake_force(pids):
+        events.append(("force", tuple(pids)))
+        return len(pids)
+
+    def tracked_clear(home, operation_id):
+        events.append(("clear", Path(home).name))
+        return original_clear(home, operation_id)
+
+    def fake_spawn(profile, home):
+        events.append(("spawn", profile))
+        ready_pids[profile] = {"asuna": 303, "kurumi": 404}[profile]
+        return ready_pids[profile]
+
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(
+        gateway,
+        "find_gateway_pids",
+        lambda *, all_profiles=False: [101, 202] if all_profiles else [],
+    )
+    monkeypatch.setattr(gateway, "find_profile_gateway_processes", lambda: processes)
+    monkeypatch.setattr(
+        gateway_windows, "_windows_fleet_restart_drain_timeout", lambda: 8.0
+    )
+    monkeypatch.setattr(
+        "gateway.status._get_process_start_time", lambda pid: float(pid)
+    )
+    monkeypatch.setattr(
+        gateway_windows, "_wait_for_known_gateway_pids_absent", fake_wait_absent
+    )
+    monkeypatch.setattr(
+        gateway_windows, "_force_terminate_known_gateway_pids", fake_force
+    )
+    monkeypatch.setattr(
+        gateway_windows, "_clear_profile_planned_stop_marker", tracked_clear
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_get_profile_gateway_pid",
+        lambda home: ready_pids.get(Path(home).name),
+    )
+    monkeypatch.setattr(gateway_windows, "_spawn_detached_profile_gateway", fake_spawn)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_wait_for_profile_gateways_ready",
+        lambda *_args, **_kwargs: dict(ready_pids),
+    )
+
+    gateway_windows.restart_running_profiles()
+
+    assert events[:3] == [
+        ("wait_absent", (101, 202), 8.0),
+        ("force", (101, 202)),
+        ("wait_absent", (101, 202), 10.0),
+    ]
+    first_spawn = next(i for i, event in enumerate(events) if event[0] == "spawn")
+    assert events[3:first_spawn] == [("clear", "asuna"), ("clear", "kurumi")]
+    assert [event for event in events if event[0] == "spawn"] == [
+        ("spawn", "asuna"),
+        ("spawn", "kurumi"),
+    ]
+    assert not any(
+        (home / ".gateway-planned-stop.json").exists() for home in homes.values()
+    )
+    assert not any(
+        (home / "gateway_maintenance.lock").exists() for home in homes.values()
+    )
+
+
+def test_restart_running_profiles_partial_spawn_failure_clears_all_pauses(
+    monkeypatch, tmp_path
+):
+    """Every watchdog pause is removed even when only one profile restores."""
+    homes = {
+        "asuna": tmp_path / "profiles" / "asuna",
+        "kurumi": tmp_path / "profiles" / "kurumi",
+    }
+    for home in homes.values():
+        home.mkdir(parents=True)
+    processes = [
+        gateway.ProfileGatewayProcess("asuna", homes["asuna"], 101),
+        gateway.ProfileGatewayProcess("kurumi", homes["kurumi"], 202),
+    ]
+    ready_pids = {}
+
+    def fake_spawn(profile, _home):
+        if profile == "kurumi":
+            raise OSError("simulated spawn failure")
+        ready_pids[profile] = 303
+        return 303
+
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(
+        gateway,
+        "find_gateway_pids",
+        lambda *, all_profiles=False: [101, 202] if all_profiles else [],
+    )
+    monkeypatch.setattr(gateway, "find_profile_gateway_processes", lambda: processes)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_write_profile_planned_stop_marker",
+        lambda home, _pid: f"owner-{Path(home).name}",
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_wait_for_known_gateway_pids_absent",
+        lambda *_args, **_kwargs: set(),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_get_profile_gateway_pid",
+        lambda home: ready_pids.get(Path(home).name),
+    )
+    monkeypatch.setattr(gateway_windows, "_spawn_detached_profile_gateway", fake_spawn)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_wait_for_profile_gateways_ready",
+        lambda *_args, **_kwargs: dict(ready_pids),
+    )
+
+    with pytest.raises(RuntimeError, match=r"kurumi \(simulated spawn failure\)"):
+        gateway_windows.restart_running_profiles()
+
+    assert ready_pids == {"asuna": 303}
+    assert not any(
+        (home / "gateway_maintenance.lock").exists() for home in homes.values()
+    )
+
+
+def test_restart_running_profiles_no_running_gateways_has_no_side_effects(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway, "find_gateway_pids", lambda *, all_profiles=False: [])
+    monkeypatch.setattr(
+        gateway,
+        "find_profile_gateway_processes",
+        lambda: pytest.fail("zero-running fast path must not inspect profiles"),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_write_profile_gateway_maintenance_marker",
+        lambda *_args: pytest.fail("zero-running fast path must not write markers"),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_spawn_detached_profile_gateway",
+        lambda *_args: pytest.fail("zero-running fast path must not spawn"),
+    )
+
+    gateway_windows.restart_running_profiles()
+
+    assert "No running profile gateways found; nothing to restart." in capsys.readouterr().out
+
+
+def test_restart_running_profiles_duplicate_profile_fails_before_markers(
+    monkeypatch, tmp_path
+):
+    homes = [tmp_path / "profile-a", tmp_path / "profile-b"]
+    for home in homes:
+        home.mkdir()
+    processes = [
+        gateway.ProfileGatewayProcess("kurumi", homes[0], 101),
+        gateway.ProfileGatewayProcess("kurumi", homes[1], 202),
+    ]
+
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(
+        gateway,
+        "find_gateway_pids",
+        lambda *, all_profiles=False: [101, 202] if all_profiles else [],
+    )
+    monkeypatch.setattr(gateway, "find_profile_gateway_processes", lambda: processes)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_write_profile_gateway_maintenance_marker",
+        lambda *_args: pytest.fail("duplicate mapping must fail before markers"),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_write_profile_planned_stop_marker",
+        lambda *_args: pytest.fail("duplicate mapping must fail before stopping"),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_spawn_detached_profile_gateway",
+        lambda *_args: pytest.fail("duplicate mapping must fail before spawning"),
+    )
+
+    with pytest.raises(RuntimeError, match="multiple running gateways"):
+        gateway_windows.restart_running_profiles()
+
+    assert not any((home / "gateway_maintenance.lock").exists() for home in homes)
+
+
+def test_planned_stop_marker_clear_requires_matching_operation(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "gateway.status._get_process_start_time", lambda pid: float(pid)
+    )
+    operation_id = gateway_windows._write_profile_planned_stop_marker(tmp_path, 101)
+    marker = tmp_path / ".gateway-planned-stop.json"
+
+    assert operation_id
+    newer_record = json.loads(marker.read_text(encoding="utf-8"))
+    newer_record["operation_id"] = "newer-operation"
+    real_replace = gateway_windows.os.replace
+
+    def replace_after_concurrent_write(source, destination):
+        marker.write_text(json.dumps(newer_record), encoding="utf-8")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(gateway_windows.os, "replace", replace_after_concurrent_write)
+
+    assert not gateway_windows._clear_profile_planned_stop_marker(
+        tmp_path, operation_id
+    )
+    assert marker.exists()
+    assert (
+        json.loads(marker.read_text(encoding="utf-8"))["operation_id"]
+        == "newer-operation"
+    )
+    assert gateway_windows._clear_profile_planned_stop_marker(
+        tmp_path, "newer-operation"
+    )
+    assert not marker.exists()
+
+
+def test_fleet_restart_drain_timeout_honors_longer_config(monkeypatch):
+    monkeypatch.setattr(gateway_windows, "_windows_stop_drain_timeout", lambda: 30.0)
+    monkeypatch.setattr(gateway, "_get_restart_drain_timeout", lambda: 180.0)
+
+    assert gateway_windows._windows_fleet_restart_drain_timeout() == 180.0
+
+
+def test_restart_running_profiles_fails_closed_for_unmapped_gateway(monkeypatch, tmp_path):
+    """Never stop a gateway that has no unique profile restore target."""
+    home = tmp_path / "profiles" / "kurumi"
+    home.mkdir(parents=True)
+    process = gateway.ProfileGatewayProcess("kurumi", home, 101)
+
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(
+        gateway,
+        "find_gateway_pids",
+        lambda *, all_profiles=False: [101, 999] if all_profiles else [],
+    )
+    monkeypatch.setattr(gateway, "find_profile_gateway_processes", lambda: [process])
+    monkeypatch.setattr(
+        gateway_windows,
+        "_write_profile_planned_stop_marker",
+        lambda *_args: pytest.fail("preflight failure must not request a stop"),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_spawn_detached_profile_gateway",
+        lambda *_args: pytest.fail("preflight failure must not spawn"),
+    )
+
+    with pytest.raises(RuntimeError, match="before stopping anything"):
+        gateway_windows.restart_running_profiles()
+
+    assert not (home / "gateway_maintenance.lock").exists()
+
+
+def test_restart_running_profiles_skips_spawn_when_watchdog_restored_profile(
+    monkeypatch, tmp_path
+):
+    """An unexpected watchdog recovery must not create a duplicate gateway."""
+    home = tmp_path / "profiles" / "rikku"
+    home.mkdir(parents=True)
+    process = gateway.ProfileGatewayProcess("rikku", home, 505)
+
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(
+        gateway,
+        "find_gateway_pids",
+        lambda *, all_profiles=False: [505] if all_profiles else [],
+    )
+    monkeypatch.setattr(gateway, "find_profile_gateway_processes", lambda: [process])
+    monkeypatch.setattr(
+        gateway_windows, "_write_profile_planned_stop_marker", lambda *_args: True
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_wait_for_known_gateway_pids_absent",
+        lambda *_args, **_kwargs: set(),
+    )
+    monkeypatch.setattr(
+        gateway_windows, "_get_profile_gateway_pid", lambda _home: 606
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_spawn_detached_profile_gateway",
+        lambda *_args: pytest.fail("already-restored profile must not be spawned"),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_wait_for_profile_gateways_ready",
+        lambda *_args, **_kwargs: {"rikku": 606},
+    )
+
+    gateway_windows.restart_running_profiles()
+
+    assert not (home / "gateway_maintenance.lock").exists()
+
+
+def test_spawn_detached_profile_gateway_targets_explicit_home(monkeypatch, tmp_path):
+    """A fleet restart must not leak the caller's HERMES_HOME into peers."""
+    target = tmp_path / "profiles" / "yuna"
+    target.mkdir(parents=True)
+    captured = {}
+
+    monkeypatch.setattr(
+        gateway,
+        "_gateway_run_args_for_profile",
+        lambda profile: ["python.exe", "-m", "hermes_cli.main", "--profile", profile, "gateway", "run", "--replace"],
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "windowless_gateway_restart_spec",
+        lambda argv: (["pythonw.exe", *argv[1:]], "ignored", {"HERMES_HOME": "caller"}),
+    )
+
+    def fake_spawn(argv, *, working_dir, env_overlay, hermes_home):
+        captured.update(
+            argv=argv,
+            working_dir=working_dir,
+            env_overlay=env_overlay,
+            hermes_home=hermes_home,
+        )
+        return 707
+
+    monkeypatch.setattr(gateway_windows, "_spawn_detached_argv", fake_spawn)
+
+    assert gateway_windows._spawn_detached_profile_gateway("yuna", target) == 707
+    assert captured["working_dir"] == str(target)
+    assert captured["hermes_home"] == target
+    assert captured["env_overlay"]["HERMES_HOME"] == str(target)
+    assert captured["argv"][-5:] == ["--profile", "yuna", "gateway", "run", "--replace"]

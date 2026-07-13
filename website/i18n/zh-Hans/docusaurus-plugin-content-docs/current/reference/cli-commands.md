@@ -223,7 +223,8 @@ hermes gateway <subcommand>
 
 | 选项 | 说明 |
 |--------|-------------|
-| `--all` | 在 `start` / `restart` / `stop` 时：对**每个 profile** 的 gateway 执行操作，而不仅限于活跃的 `HERMES_HOME`。当你并行运行多个 profile 并希望在 `hermes update` 后全部重启时很有用。 |
+| `--all` | 在 `restart` 时停止所有 profile 的 gateway，然后**仅启动当前 profile**；在 `stop` 时停止所有 profile 的 gateway；在 `start` 时先清理所有 profile 的陈旧 gateway 进程，再启动当前 profile。这个历史参数不会保留命令开始前正在运行的 profile 集合。 |
+| `--all-running` | 在 Windows 的 `restart` 中，安全重启命令开始时正在运行的每个 profile gateway。Hermes 会暂停各 profile 的 watchdog 恢复、排空整个 gateway 集合、每个唯一 profile 只恢复一次，并验证所有替换进程。如果某个正在运行的 gateway 无法可靠映射到 profile，操作会在停止任何进程之前失败。 |
 | `--no-supervise` | 在 `run` 时：在 s6-overlay Docker 镜像内部，跳过 s6 自动监管，退回到 pre-s6 前台语义——gateway 作为容器主进程运行，无自动重启。在 s6 镜像之外为空操作。等同于设置 `HERMES_GATEWAY_NO_SUPERVISE=1`。 |
 
 :::tip WSL 用户
