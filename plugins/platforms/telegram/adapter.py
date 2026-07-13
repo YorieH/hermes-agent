@@ -16,8 +16,9 @@ import os
 import html as _html
 import re
 import threading
+import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set, Any
+from typing import Callable, Dict, List, Optional, Set, Any
 
 logger = logging.getLogger(__name__)
 
@@ -423,6 +424,131 @@ _UPDATER_STOP_TIMEOUT = 15.0
 # trigger its own recovery path. Refs: NousResearch/hermes-agent#59614
 _UPDATER_START_TIMEOUT = 30.0
 
+# PTB's Updater defaults to a 10-second Telegram long poll. Keep that value
+# explicit at every start_polling() call so the stale-progress budget below is
+# coupled to the actual request cadence rather than an upstream default that
+# could change silently.
+_TELEGRAM_LONG_POLL_TIMEOUT = 10.0
+# A single getUpdates request can legitimately consume the configured HTTP read
+# timeout plus the Telegram long-poll timeout. Require four whole request
+# budgets, with a three-minute floor, before declaring an otherwise silent
+# poller stale. This leaves ample room for transient slow requests and PTB's
+# own in-process retry behavior without letting a no-error hung socket remain
+# "connected" forever.
+_POLL_PROGRESS_STALE_FLOOR = 180.0
+_POLL_PROGRESS_REQUEST_BUDGETS = 4.0
+_POLL_PROGRESS_STATUS_INTERVAL = 30.0
+
+
+def _poll_progress_stale_after(read_timeout: float) -> float:
+    """Return the conservative no-progress deadline for getUpdates polling."""
+    return max(
+        _POLL_PROGRESS_STALE_FLOOR,
+        _POLL_PROGRESS_REQUEST_BUDGETS
+        * (max(0.0, float(read_timeout)) + _TELEGRAM_LONG_POLL_TIMEOUT),
+    )
+
+
+class _PollingProgress:
+    """Sanitized clocks for one Telegram polling generation.
+
+    Only monotonic timing and an ISO wall-clock completion timestamp are kept;
+    update payloads, URLs, chat IDs, and bot tokens never enter this state.
+    The clock callables are injectable so the liveness contract is testable
+    without real sleeps.
+    """
+
+    def __init__(
+        self,
+        stale_after_seconds: float,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    ) -> None:
+        self.stale_after_seconds = float(stale_after_seconds)
+        self._monotonic = monotonic
+        self._wall_clock = wall_clock
+        self.generation_started_monotonic: Optional[float] = None
+        self.last_success_monotonic: Optional[float] = None
+        self.last_success_at: Optional[str] = None
+
+    def begin_generation(self) -> float:
+        """Start a new poller generation while retaining prior diagnostics."""
+        now = self._monotonic()
+        self.generation_started_monotonic = now
+        return now
+
+    def mark_success(self) -> float:
+        """Record one successfully completed long-poll request."""
+        now = self._monotonic()
+        self.last_success_monotonic = now
+        self.last_success_at = self._wall_clock().astimezone(timezone.utc).isoformat()
+        return now
+
+    def seconds_since_progress(self) -> Optional[float]:
+        """Seconds since this generation began or its most recent success."""
+        candidates = [
+            value
+            for value in (
+                self.generation_started_monotonic,
+                self.last_success_monotonic,
+            )
+            if value is not None
+        ]
+        if not candidates:
+            return None
+        return max(0.0, self._monotonic() - max(candidates))
+
+    def is_stale(self) -> bool:
+        age = self.seconds_since_progress()
+        return age is not None and age >= self.stale_after_seconds
+
+
+def _build_polling_progress_request(
+    on_poll_success: Callable[[], None],
+    **request_kwargs: Any,
+) -> Any:
+    """Build the dedicated getUpdates request with a success-only callback.
+
+    PTB exposes separate request objects for general Bot API traffic and
+    getUpdates. Wrapping the latter at ``do_request`` is the smallest seam that
+    observes an idle long poll completing without inspecting update data. The
+    callback runs only for a positive-timeout successful HTTP response; PTB's
+    timeout=0 shutdown ACK is deliberately excluded so teardown cannot
+    masquerade as steady-state polling progress. The response body is never
+    parsed, copied, persisted, or logged here.
+
+    Some import-isolation tests replace ``HTTPXRequest`` with a constructor-only
+    test double. In that case return the double unchanged; real PTB always
+    provides the overridable ``do_request`` method.
+    """
+    request_type = HTTPXRequest
+    if not isinstance(request_type, type) or not callable(
+        getattr(request_type, "do_request", None)
+    ):
+        return request_type(**request_kwargs)
+
+    class _PollingProgressHTTPXRequest(request_type):
+        async def do_request(self, *args: Any, **kwargs: Any):
+            code, payload = await super().do_request(*args, **kwargs)
+            request_data = kwargs.get("request_data")
+            if request_data is None and len(args) >= 3:
+                request_data = args[2]
+            try:
+                parameters = getattr(request_data, "parameters", {}) or {}
+                timeout_value = parameters.get("timeout", 0)
+                if hasattr(timeout_value, "total_seconds"):
+                    timeout_value = timeout_value.total_seconds()
+                is_long_poll = float(timeout_value or 0) > 0
+                if is_long_poll and 200 <= int(code) < 300:
+                    on_poll_success()
+            except Exception:
+                # Observability must never become part of the delivery path.
+                logger.debug("Telegram poll-progress callback failed", exc_info=True)
+            return code, payload
+
+    return _PollingProgressHTTPXRequest(**request_kwargs)
+
 
 class TelegramAdapter(BasePlatformAdapter):
     """
@@ -583,6 +709,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_network_error_count: int = 0
         self._polling_error_callback_ref = None
         self._polling_heartbeat_task: Optional[asyncio.Task] = None
+        self._polling_progress = _PollingProgress(
+            _poll_progress_stale_after(20.0)
+        )
+        self._polling_progress_last_status_write: Optional[float] = None
         # Consecutive heartbeat probes that saw queued updates the running
         # poller is not consuming. get_me() can't see this — the send path is
         # healthy while the getUpdates consumer is wedged — so the heartbeat
@@ -2006,12 +2136,14 @@ class TelegramAdapter(BasePlatformAdapter):
             # recovery instead of blocking connect() indefinitely.
             await asyncio.wait_for(
                 self._app.updater.start_polling(
+                    timeout=_TELEGRAM_LONG_POLL_TIMEOUT,
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=drop_pending_updates,
                     error_callback=error_callback,
                 ),
                 timeout=_UPDATER_START_TIMEOUT,
             )
+            self._begin_polling_progress()
             return True
         except Exception as err:
             if self._looks_like_polling_conflict(err):
@@ -2123,6 +2255,7 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 await asyncio.wait_for(
                     app.updater.start_polling(
+                        timeout=_TELEGRAM_LONG_POLL_TIMEOUT,
                         allowed_updates=Update.ALL_TYPES,
                         drop_pending_updates=False,
                         error_callback=self._polling_error_callback_ref,
@@ -2133,6 +2266,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 raise RuntimeError(
                     "start_polling() timed out — connection pool may be wedged"
                 )
+            self._begin_polling_progress()
             logger.info(
                 "[%s] Telegram polling resumed after network error (attempt %d)",
                 self.name, attempt,
@@ -2216,6 +2350,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 # double), so there is nothing to probe — exit rather than spin.
                 if not callable(getattr(bot, "get_me", None)):
                     return
+                # The successful-cycle clock is independent of Telegram's
+                # general request pool. Check it before getMe/webhook probes so
+                # a cancellation-shielded general-path stall cannot hide a
+                # wedged getUpdates loop. Recovery owns the cycle once started.
+                if self._recover_stale_polling_if_needed():
+                    continue
                 await asyncio.wait_for(bot.get_me(), PROBE_TIMEOUT)
                 # get_me() succeeded — the general/send request path is healthy.
                 # That does NOT prove the getUpdates consumer is alive: PTB can
@@ -2238,6 +2378,76 @@ class TelegramAdapter(BasePlatformAdapter):
                 # Non-connectivity errors (e.g. TelegramError 401) are not
                 # CLOSE-WAIT symptoms — let PTB's own handlers surface them.
                 pass
+
+    def _get_polling_progress(self) -> _PollingProgress:
+        """Return progress state, including object.__new__ test compatibility."""
+        progress = getattr(self, "_polling_progress", None)
+        if progress is None:
+            progress = _PollingProgress(_poll_progress_stale_after(20.0))
+            self._polling_progress = progress
+        return progress
+
+    def _begin_polling_progress(self) -> None:
+        """Begin a poller generation and expose sanitized waiting health."""
+        progress = self._get_polling_progress()
+        progress.begin_generation()
+        self._polling_progress_last_status_write = None
+        self._write_runtime_status_safe(
+            "telegram-poll-waiting",
+            poll_state="waiting",
+            poll_last_success_at=progress.last_success_at,
+            poll_stale_after_seconds=progress.stale_after_seconds,
+        )
+
+    def _record_polling_success(self) -> None:
+        """Record one completed idle-or-active long poll without payload data."""
+        progress = self._get_polling_progress()
+        now = progress.mark_success()
+        last_write = getattr(self, "_polling_progress_last_status_write", None)
+        if last_write is not None and now - last_write < _POLL_PROGRESS_STATUS_INTERVAL:
+            return
+        self._polling_progress_last_status_write = now
+        self._write_runtime_status_safe(
+            "telegram-poll-progress",
+            poll_state="healthy",
+            poll_last_success_at=progress.last_success_at,
+            poll_stale_after_seconds=progress.stale_after_seconds,
+        )
+
+    def _recover_stale_polling_if_needed(self) -> bool:
+        """Schedule exactly one existing-ladder recovery for a stale poller."""
+        if getattr(self, "_webhook_mode", False) or self.has_fatal_error:
+            return False
+        updater = getattr(self._app, "updater", None) if self._app else None
+        if updater is None or not getattr(updater, "running", False):
+            # _probe_pending_updates owns the stopped-updater case.
+            return False
+        polling_error_task = getattr(self, "_polling_error_task", None)
+        if polling_error_task and not polling_error_task.done():
+            return False
+        progress = self._get_polling_progress()
+        if not progress.is_stale():
+            return False
+        age = progress.seconds_since_progress()
+        self._write_runtime_status_safe(
+            "telegram-poll-stale",
+            poll_state="stale",
+            poll_last_success_at=progress.last_success_at,
+            poll_stale_after_seconds=progress.stale_after_seconds,
+        )
+        logger.warning(
+            "[%s] Telegram getUpdates made no successful progress for %.0fs "
+            "(stale threshold %.0fs); triggering bounded polling recovery",
+            self.name,
+            age or 0.0,
+            progress.stale_after_seconds,
+        )
+        previous = polling_error_task
+        self._schedule_polling_recovery(
+            TimeoutError("Telegram getUpdates progress heartbeat became stale"),
+            reason="stale getUpdates progress",
+        )
+        return getattr(self, "_polling_error_task", None) is not previous
 
     async def _probe_pending_updates(self, bot, probe_timeout: float) -> None:
         """Detect a wedged getUpdates consumer via pending_update_count.
@@ -2538,6 +2748,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 try:
                     await asyncio.wait_for(
                         app.updater.start_polling(
+                            timeout=_TELEGRAM_LONG_POLL_TIMEOUT,
                             allowed_updates=Update.ALL_TYPES,
                             drop_pending_updates=False,
                             error_callback=self._polling_error_callback_ref,
@@ -2548,6 +2759,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     raise RuntimeError(
                         "start_polling() timed out — connection pool may be wedged"
                     )
+                self._begin_polling_progress()
                 logger.info(
                     "[%s] Telegram polling resumed after conflict retry %d/%d",
                     self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES,
@@ -3098,6 +3310,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 "read_timeout": _env_float("HERMES_TELEGRAM_HTTP_READ_TIMEOUT", 20.0),
                 "write_timeout": _env_float("HERMES_TELEGRAM_HTTP_WRITE_TIMEOUT", 20.0),
             }
+            self._polling_progress.stale_after_seconds = _poll_progress_stale_after(
+                request_kwargs["read_timeout"]
+            )
 
             # CLOSE_WAIT fd leak (#31599, same class as #18451): PTB's
             # HTTPXRequest builds the underlying httpx.AsyncClient with
@@ -3199,7 +3414,8 @@ class TelegramAdapter(BasePlatformAdapter):
                         )
                     },
                 )
-                get_updates_request = HTTPXRequest(
+                get_updates_request = _build_polling_progress_request(
+                    self._record_polling_success,
                     **request_kwargs,
                     httpx_kwargs={
                         "transport": TelegramFallbackTransport(
@@ -3212,14 +3428,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 request = HTTPXRequest(
                     **request_kwargs, proxy=proxy_url, httpx_kwargs=_with_limits()
                 )
-                get_updates_request = HTTPXRequest(
+                get_updates_request = _build_polling_progress_request(
+                    self._record_polling_success,
                     **request_kwargs, proxy=proxy_url, httpx_kwargs=_with_limits()
                 )
             else:
                 if disable_fallback:
                     logger.info("[%s] Telegram fallback-IP transport disabled via env", self.name)
                 request = HTTPXRequest(**request_kwargs, httpx_kwargs=_with_limits())
-                get_updates_request = HTTPXRequest(
+                get_updates_request = _build_polling_progress_request(
+                    self._record_polling_success,
                     **request_kwargs, httpx_kwargs=_with_limits()
                 )
 

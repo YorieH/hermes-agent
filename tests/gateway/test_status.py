@@ -641,6 +641,24 @@ class TestGatewayRuntimeStatus:
         assert payload["platforms"]["telegram"]["error_code"] == "telegram_polling_conflict"
         assert payload["platforms"]["telegram"]["error_message"] == "another poller is active"
 
+    def test_write_runtime_status_records_sanitized_poll_progress(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        status.write_runtime_status(
+            platform="telegram",
+            platform_state="connected",
+            poll_state="healthy",
+            poll_last_success_at="2026-07-14T00:00:25+00:00",
+            poll_stale_after_seconds=180.0,
+        )
+
+        platform = status.read_runtime_status()["platforms"]["telegram"]
+        assert platform["state"] == "connected"
+        assert platform["poll_state"] == "healthy"
+        assert platform["poll_last_success_at"] == "2026-07-14T00:00:25+00:00"
+        assert platform["poll_stale_after_seconds"] == 180.0
+        assert {"token", "chat_id", "update_payload", "request_url"}.isdisjoint(platform)
+
     def test_write_runtime_status_explicit_none_clears_stale_fields(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 

@@ -7005,6 +7005,12 @@ def _messaging_platform_payload(
     }
     if whatsapp_setup is not None:
         payload["whatsapp_setup"] = whatsapp_setup
+    if platform_id == "telegram" and isinstance(runtime_platform, dict):
+        payload["poll_state"] = runtime_platform.get("poll_state")
+        payload["poll_last_success_at"] = runtime_platform.get("poll_last_success_at")
+        payload["poll_stale_after_seconds"] = runtime_platform.get(
+            "poll_stale_after_seconds"
+        )
     return payload
 
 
