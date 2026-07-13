@@ -87,8 +87,11 @@ def test_dispatcher_external_drain_pauses_then_resumes(monkeypatch, tmp_path):
             return None
 
     monkeypatch.setattr(kanban_db, "connect", lambda board=None: FakeConnection())
-    monkeypatch.setattr(kanban_db, "has_spawnable_ready", lambda conn: False)
-    monkeypatch.setattr(kanban_db, "has_spawnable_review", lambda conn: False)
+    monkeypatch.setattr(
+        kanban_db,
+        "has_unexpectedly_unspawned_work",
+        lambda conn, result: False,
+    )
 
     dispatch_calls = []
 
@@ -118,6 +121,112 @@ def test_dispatcher_external_drain_pauses_then_resumes(monkeypatch, tmp_path):
 
     assert dispatch_calls == [kanban_db.DEFAULT_BOARD]
     assert sleeps == 1
+
+
+def test_dispatcher_health_uses_tick_aware_pending_signal(
+    monkeypatch, tmp_path, caplog,
+):
+    """Expected deferrals must not accumulate the ready-queue stuck alarm.
+
+    ``has_spawnable_ready=True`` models the old post-tick probe. The new
+    result-aware helper says the queued card was intentionally deferred; if
+    the watcher regresses to the old probe, six ticks emit a warning.
+    """
+    import asyncio
+    import logging
+    from types import SimpleNamespace
+
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as config_module
+    import hermes_cli.kanban_db as kanban_db
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+
+    monkeypatch.setattr(
+        config_module,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "dispatch_interval_seconds": 1,
+                "auto_decompose": False,
+            }
+        },
+    )
+    monkeypatch.setattr(kanban_db, "kanban_home", lambda: tmp_path)
+    monkeypatch.setattr(kanban_db, "reap_worker_zombies", lambda: [])
+    monkeypatch.setattr(
+        kanban_db,
+        "list_boards",
+        lambda include_archived=False: [{"slug": kanban_db.DEFAULT_BOARD}],
+    )
+    monkeypatch.setattr(
+        kanban_db,
+        "kanban_db_path",
+        lambda board=None: tmp_path / "kanban.db",
+    )
+
+    class FakeConnection:
+        def close(self):
+            return None
+
+    monkeypatch.setattr(kanban_db, "connect", lambda board=None: FakeConnection())
+    monkeypatch.setattr(kanban_db, "has_spawnable_ready", lambda conn: True)
+    monkeypatch.setattr(kanban_db, "has_spawnable_review", lambda conn: False)
+    monkeypatch.setattr(
+        kanban_db,
+        "has_unexpectedly_unspawned_work",
+        lambda conn, result: False,
+    )
+
+    dispatch_calls = 0
+
+    def dispatch_once(conn, **kwargs):
+        nonlocal dispatch_calls
+        dispatch_calls += 1
+        if dispatch_calls >= 6:
+            runner._running = False
+        return SimpleNamespace(
+            spawned=[], reclaimed=0, crashed=[], timed_out=[], promoted=0,
+            auto_blocked=[],
+        )
+
+    async def fake_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(kanban_db, "dispatch_once", dispatch_once)
+    monkeypatch.setattr("gateway.kanban_watchers.asyncio.sleep", fake_sleep)
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        asyncio.run(runner._kanban_dispatcher_watcher())
+
+    assert dispatch_calls == 6
+    assert not any(
+        "kanban dispatcher stuck" in record.getMessage()
+        for record in caplog.records
+    )
+
+    # The same watcher must still warn when the tick-aware probe identifies a
+    # real unspawned launch (for example, a missing venv/PATH executable).
+    caplog.clear()
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    dispatch_calls = 0
+    monkeypatch.setattr(
+        kanban_db,
+        "has_unexpectedly_unspawned_work",
+        lambda conn, result: True,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="gateway.run"):
+        asyncio.run(runner._kanban_dispatcher_watcher())
+
+    assert dispatch_calls == 6
+    assert sum(
+        "kanban dispatcher stuck" in record.getMessage()
+        for record in caplog.records
+    ) == 1
 
 
 def test_singleton_dispatcher_lock_is_exclusive(tmp_path):

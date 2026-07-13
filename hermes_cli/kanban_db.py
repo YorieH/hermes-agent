@@ -6412,6 +6412,36 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    capacity_limited: bool = False
+    """True when the board-wide live concurrency cap prevented additional
+    ready/review work from being dispatched this tick. This is expected
+    backpressure, not evidence that worker startup is broken."""
+
+    @property
+    def expectedly_deferred_task_ids(self) -> set[str]:
+        """Task ids intentionally left queued by dispatcher policy.
+
+        These cards were not dispatchable *this tick*: their assignee is a
+        control-plane lane, another worker owns their workspace, their profile
+        is at capacity, or a non-actionable respawn guard says useful work is
+        already in flight/recent. ``blocker_auth`` is deliberately excluded
+        because a credential/provider configuration failure is exactly the
+        actionable startup pathology the stuck-dispatcher alarm must retain.
+        """
+        deferred = set(self.skipped_nonspawnable)
+        deferred.update(
+            task_id
+            for task_id, _assignee, _current in self.skipped_per_profile_capped
+        )
+        deferred.update(
+            task_id for task_id, _owner_task_id, _path in self.workspace_guarded
+        )
+        deferred.update(
+            task_id
+            for task_id, reason in self.respawn_guarded
+            if reason != "blocker_auth"
+        )
+        return deferred
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -7594,7 +7624,11 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     return None
 
 
-def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
+def has_spawnable_ready(
+    conn: sqlite3.Connection,
+    *,
+    exclude_task_ids: Iterable[str] = (),
+) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
 
@@ -7607,12 +7641,17 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     Falls back to "any ready+assigned" if ``profile_exists`` is not
     importable (e.g. partial install) — preserves the old behavior so
     the warning still fires in degraded environments.
+
+    ``exclude_task_ids`` removes cards already classified by the completed
+    dispatch tick as intentional deferrals.
     """
+    excluded = set(exclude_task_ids)
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
+    rows = [row for row in rows if row["id"] not in excluded]
     if not rows:
         return False
     try:
@@ -7626,19 +7665,28 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     return False
 
 
-def has_spawnable_review(conn: sqlite3.Connection) -> bool:
+def has_spawnable_review(
+    conn: sqlite3.Connection,
+    *,
+    exclude_task_ids: Iterable[str] = (),
+) -> bool:
     """Return True iff there is at least one review+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
 
     Mirror of :func:`has_spawnable_ready` for the review column —
     used by the health telemetry to decide whether the dispatcher
     should have spawned a review agent.
+
+    ``exclude_task_ids`` has the same intentional-deferral semantics as the
+    ready-column helper.
     """
+    excluded = set(exclude_task_ids)
     rows = conn.execute(
-        "SELECT DISTINCT assignee FROM tasks "
+        "SELECT id, assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
         "    AND claim_lock IS NULL"
     ).fetchall()
+    rows = [row for row in rows if row["id"] not in excluded]
     if not rows:
         return False
     try:
@@ -7649,6 +7697,30 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
         if profile_exists(row["assignee"]):
             return True
     return False
+
+
+def has_unexpectedly_unspawned_work(
+    conn: sqlite3.Connection,
+    result: DispatchResult,
+) -> bool:
+    """Return whether a completed tick left genuinely dispatchable work.
+
+    A plain ready/review query cannot answer this after a dispatch pass: cards
+    may remain queued because of workspace leases, concurrency backpressure,
+    respawn guards, or another dispatcher holding the board lock. Those are
+    expected deferrals and must not accumulate ``bad_ticks``. Work that failed
+    during workspace/process startup remains ready and is *not* in an expected
+    bucket, so PATH/venv failures still raise the health signal. Auth blockers
+    likewise remain actionable and are intentionally not filtered.
+    """
+    if result.skipped_locked or result.capacity_limited:
+        return False
+    excluded = result.expectedly_deferred_task_ids
+    return has_spawnable_ready(
+        conn, exclude_task_ids=excluded,
+    ) or has_spawnable_review(
+        conn, exclude_task_ids=excluded,
+    )
 
 
 def dispatch_once(
@@ -7834,6 +7906,7 @@ def _dispatch_once_locked(
         and effective_concurrency_cap is not None
         and running_count >= effective_concurrency_cap
     ):
+        result.capacity_limited = True
         return result
     spawned = 0
     try:
@@ -7884,6 +7957,7 @@ def _dispatch_once_locked(
             effective_concurrency_cap is not None
             and running_count + spawned >= effective_concurrency_cap
         ):
+            result.capacity_limited = True
             break
         row_assignee = row["assignee"]
         if not row_assignee:
@@ -8171,6 +8245,7 @@ def _dispatch_once_locked(
     ).fetchall()
     for row in review_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
+            result.capacity_limited = True
             break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])

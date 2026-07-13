@@ -1700,6 +1700,7 @@ def test_dispatch_skips_nonspawnable_into_separate_bucket(kanban_home, monkeypat
         t = kb.create_task(conn, title="for-terminal", assignee="orion-cc")
         res = kb.dispatch_once(conn, dry_run=True)
     assert t in res.skipped_nonspawnable
+    assert t in res.expectedly_deferred_task_ids
     assert t not in res.skipped_unassigned
     assert not res.spawned
 
@@ -1736,6 +1737,64 @@ def test_has_spawnable_ready_false_on_empty_queue(kanban_home):
         assert kb.has_spawnable_ready(conn) is False
 
 
+def test_dispatch_health_filters_expected_guards_but_not_auth(
+    kanban_home, all_assignees_spawnable,
+):
+    """Only non-actionable respawn guards are intentional deferrals.
+
+    An existing PR is expectedly idle, while a credential/auth blocker must
+    keep the original profile-health alarm alive.
+    """
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="guarded", assignee="alice")
+
+        expected = kb.DispatchResult(
+            respawn_guarded=[(task_id, "active_pr")],
+        )
+        assert kb.has_unexpectedly_unspawned_work(conn, expected) is False
+
+        actionable = kb.DispatchResult(
+            respawn_guarded=[(task_id, "blocker_auth")],
+        )
+        assert kb.has_unexpectedly_unspawned_work(conn, actionable) is True
+
+
+def test_dispatch_health_ignores_tick_lost_to_dispatch_lock(
+    kanban_home, all_assignees_spawnable,
+):
+    """A second dispatcher losing the board lock is correctly idle."""
+    with kb.connect() as conn:
+        kb.create_task(conn, title="queued", assignee="alice")
+        result = kb.DispatchResult(skipped_locked=True)
+        assert kb.has_unexpectedly_unspawned_work(conn, result) is False
+
+
+def test_dispatch_health_ignores_ready_row_rejected_by_parent_guard(
+    kanban_home, all_assignees_spawnable,
+):
+    """A structurally invalid ready row is demoted, not diagnosed as stuck."""
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="alice")
+        kb.claim_task(conn, parent)
+        child = kb.create_task(
+            conn, title="child", assignee="bob", parents=[parent],
+        )
+        with kb.write_txn(conn):
+            # Simulate a stale/racy writer that bypassed link-time demotion.
+            conn.execute(
+                "UPDATE tasks SET status = 'ready' WHERE id = ?",
+                (child,),
+            )
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: pytest.fail("must not spawn"),
+        )
+
+        assert kb.get_task(conn, child).status == "todo"
+        assert kb.has_unexpectedly_unspawned_work(conn, result) is False
+
+
 def test_dispatch_promotes_ready_and_spawns(kanban_home, all_assignees_spawnable):
     spawns = []
 
@@ -1763,10 +1822,13 @@ def test_dispatch_spawn_failure_releases_claim(kanban_home, all_assignees_spawna
 
     with kb.connect() as conn:
         t = kb.create_task(conn, title="boom", assignee="alice")
-        kb.dispatch_once(conn, spawn_fn=boom)
+        result = kb.dispatch_once(conn, spawn_fn=boom, failure_limit=10)
         # Must return to ready so the next tick can retry.
         assert kb.get_task(conn, t).status == "ready"
         assert kb.get_task(conn, t).claim_lock is None
+        # A real process-start failure remains alarm-worthy. If the health
+        # probe excluded every queued task, PATH/venv failures would go silent.
+        assert kb.has_unexpectedly_unspawned_work(conn, result) is True
 
 
 def test_dispatch_max_spawn_counts_existing_running_tasks(
@@ -1793,8 +1855,10 @@ def test_dispatch_max_spawn_counts_existing_running_tasks(
         res = kb.dispatch_once(conn, spawn_fn=fake_spawn, max_spawn=2)
 
         assert res.spawned == []
+        assert res.capacity_limited is True
         assert spawns == []
         assert kb.get_task(conn, ready).status == "ready"
+        assert kb.has_unexpectedly_unspawned_work(conn, res) is False
 
 
 def test_dispatch_max_spawn_fills_remaining_capacity(
@@ -1818,6 +1882,24 @@ def test_dispatch_max_spawn_fills_remaining_capacity(
         assert spawns == [ready_a]
         assert kb.get_task(conn, ready_a).status == "running"
         assert kb.get_task(conn, ready_b).status == "ready"
+
+
+def test_dispatch_health_ignores_per_profile_capacity_backpressure(
+    kanban_home, all_assignees_spawnable,
+):
+    with kb.connect() as conn:
+        running = kb.create_task(conn, title="running", assignee="alice")
+        waiting = kb.create_task(conn, title="waiting", assignee="alice")
+        kb.claim_task(conn, running)
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: pytest.fail("must not spawn"),
+            max_in_progress_per_profile=1,
+        )
+
+        assert result.skipped_per_profile_capped == [(waiting, "alice", 1)]
+        assert kb.has_unexpectedly_unspawned_work(conn, result) is False
 
 
 def test_dispatch_defers_same_mutable_workspace_across_assignees(
@@ -1845,6 +1927,7 @@ def test_dispatch_defers_same_mutable_workspace_across_assignees(
             (waiting, owner, kb._normalize_workspace_lease_path(str(shared)))
         ]
         assert kb.get_task(conn, waiting).status == "ready"
+        assert kb.has_unexpectedly_unspawned_work(conn, result) is False
 
 
 def test_dispatch_windows_workspace_guard_normalizes_case_separators_and_segments(

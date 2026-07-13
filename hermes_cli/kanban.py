@@ -2328,7 +2328,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     health_state = {"bad_ticks": 0, "last_warn_at": 0}
 
     def _on_tick(res):
-        ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
+        ready_pending = _ready_queue_nonempty(res)
         spawned_any = bool(res.spawned)
         if ready_pending and not spawned_any:
             health_state["bad_ticks"] += 1
@@ -2342,8 +2342,9 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             if now - health_state["last_warn_at"] >= 300:
                 print(
                     f"[{_fmt_ts(now)}] WARN dispatcher stuck: "
-                    f"ready queue non-empty for {health_state['bad_ticks']} "
-                    f"consecutive ticks but 0 workers spawned successfully. "
+                    f"dispatchable ready/review work remained for "
+                    f"{health_state['bad_ticks']} consecutive ticks but 0 "
+                    f"workers spawned successfully. "
                     f"Check profile health (venv, PATH, credentials) and "
                     f"`hermes kanban list --status ready` / "
                     f"`hermes kanban list --status blocked` for recent "
@@ -2367,19 +2368,11 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
                 flush=True,
             )
 
-    def _ready_queue_nonempty() -> bool:
-        """Cheap probe — is there at least one ready+assigned+unclaimed
-        task whose assignee maps to a real Hermes profile (i.e. one the
-        dispatcher would actually try to spawn for)?
-
-        Filters out tasks assigned to control-plane lanes
-        (e.g. ``orion-cc``, ``orion-research``) that are pulled by
-        terminals via ``claim_task`` directly — those are correctly idle
-        from the dispatcher's perspective, not stuck.
-        """
+    def _ready_queue_nonempty(res) -> bool:
+        """Did this tick leave real work unexpectedly unspawned?"""
         try:
             with kb.connect_closing() as conn:
-                return kb.has_spawnable_ready(conn)
+                return kb.has_unexpectedly_unspawned_work(conn, res)
         except Exception:
             return False
 
