@@ -45,6 +45,81 @@ def test_watcher_loops_are_coroutines():
     assert inspect.iscoroutinefunction(GatewayKanbanWatchersMixin._kanban_dispatcher_watcher)
 
 
+def test_dispatcher_external_drain_pauses_then_resumes(monkeypatch, tmp_path):
+    """A maintenance drain must quiesce ready work, then resume cleanly."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from gateway.run import GatewayRunner
+    import hermes_cli.config as config_module
+    import hermes_cli.kanban_db as kanban_db
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._external_drain_active = True
+
+    monkeypatch.setattr(
+        config_module,
+        "load_config",
+        lambda: {
+            "kanban": {
+                "dispatch_in_gateway": True,
+                "dispatch_interval_seconds": 1,
+                "auto_decompose": False,
+            }
+        },
+    )
+    monkeypatch.setattr(kanban_db, "kanban_home", lambda: tmp_path)
+    monkeypatch.setattr(kanban_db, "reap_worker_zombies", lambda: [])
+    monkeypatch.setattr(
+        kanban_db,
+        "list_boards",
+        lambda include_archived=False: [{"slug": kanban_db.DEFAULT_BOARD}],
+    )
+    monkeypatch.setattr(
+        kanban_db,
+        "kanban_db_path",
+        lambda board=None: tmp_path / "kanban.db",
+    )
+
+    class FakeConnection:
+        def close(self):
+            return None
+
+    monkeypatch.setattr(kanban_db, "connect", lambda board=None: FakeConnection())
+    monkeypatch.setattr(kanban_db, "has_spawnable_ready", lambda conn: False)
+    monkeypatch.setattr(kanban_db, "has_spawnable_review", lambda conn: False)
+
+    dispatch_calls = []
+
+    def dispatch_once(conn, **kwargs):
+        dispatch_calls.append(kwargs.get("board"))
+        runner._running = False
+        return SimpleNamespace(
+            spawned=[], reclaimed=0, crashed=[], timed_out=[], promoted=0,
+            auto_blocked=[],
+        )
+
+    monkeypatch.setattr(kanban_db, "dispatch_once", dispatch_once)
+
+    sleeps = 0
+
+    async def fake_sleep(_delay):
+        nonlocal sleeps
+        sleeps += 1
+        # The first dispatch interval is entirely drained.  Releasing the
+        # marker allows exactly one dispatch on the following tick.
+        if sleeps == 1:
+            runner._external_drain_active = False
+
+    monkeypatch.setattr("gateway.kanban_watchers.asyncio.sleep", fake_sleep)
+
+    asyncio.run(runner._kanban_dispatcher_watcher())
+
+    assert dispatch_calls == [kanban_db.DEFAULT_BOARD]
+    assert sleeps == 1
+
+
 def test_singleton_dispatcher_lock_is_exclusive(tmp_path):
     """Only one holder of the dispatcher lock at a time — the backstop that
     stops concurrent dispatchers double reclaiming and corrupting shared

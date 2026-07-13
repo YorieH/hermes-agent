@@ -1428,6 +1428,7 @@ class GatewayKanbanWatchersMixin:
         logger.info(
             "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
         )
+        external_drain_logged = False
         while self._running:
             try:
                 # Reap zombie children before per-board work so a board DB
@@ -1441,6 +1442,35 @@ class GatewayKanbanWatchersMixin:
                     )
             except Exception:
                 logger.exception("kanban dispatcher: zombie reaper failed")
+
+            # An external maintenance drain is a machine-wide quiesce request,
+            # not just a chat-input gate.  Keep the harmless zombie reaper
+            # above active, but do not auto-decompose cards or launch workers
+            # while the gateway reports itself as draining.  Otherwise a
+            # ready card can start after the operator observed active_agents=0
+            # and race a checkout/update underneath the new worker.
+            if getattr(self, "_external_drain_active", False):
+                if not external_drain_logged:
+                    logger.info(
+                        "kanban dispatcher: external drain active; pausing "
+                        "auto-decompose and worker dispatch"
+                    )
+                    external_drain_logged = True
+                bad_ticks = 0
+                # Use the common interruptible sleep below.  The drain-control
+                # watcher clears the flag and dispatch resumes on the next tick.
+                slept = 0.0
+                while slept < interval and self._running:
+                    await asyncio.sleep(min(1.0, interval - slept))
+                    slept += 1.0
+                continue
+
+            if external_drain_logged:
+                logger.info(
+                    "kanban dispatcher: external drain released; resuming "
+                    "auto-decompose and worker dispatch"
+                )
+                external_drain_logged = False
 
             try:
                 # Re-read the auto-decompose toggle live each tick so a user
