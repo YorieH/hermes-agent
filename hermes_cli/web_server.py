@@ -3440,6 +3440,10 @@ async def gateway_drain(request: Request):
     network-exposed bind.
 
     Body: ``{"action": "drain"}`` (begin) or ``{"action": "cancel"}`` (cancel).
+    Automated helpers may add ``lease_seconds``, ``owner_pid``, and
+    ``owner_start_time`` so their marker self-releases after expiry or definite
+    owner death/PID reuse. Manual dashboard/NAS drains remain persistent when
+    those fields are omitted.
     Begin writes the ``.drain_request.json`` marker the gateway's
     ``_drain_control_watcher`` observes (flip to ``draining`` + refuse new
     turns); cancel removes it (revert to ``running`` + re-accept). Idempotent
@@ -3479,10 +3483,18 @@ async def gateway_drain(request: Request):
             detail=f"Unknown drain action {action!r}; expected 'drain' or 'cancel'",
         )
 
-    payload = write_drain_request(
-        principal=str(principal),
-        suppress_notification=bool((body or {}).get("suppress_notification", False)),
-    )
+    try:
+        payload = write_drain_request(
+            principal=str(principal),
+            suppress_notification=bool(
+                (body or {}).get("suppress_notification", False)
+            ),
+            lease_seconds=(body or {}).get("lease_seconds"),
+            owner_pid=(body or {}).get("owner_pid"),
+            owner_start_time=(body or {}).get("owner_start_time"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     _log.info(
         "Gateway drain BEGIN requested by %s (suppress_notification=%s)",
         principal,
@@ -3496,6 +3508,8 @@ async def gateway_drain(request: Request):
         # the gateway watcher flips gateway_state -> draining within ~1s.
         "draining": drain_requested(),
         "suppress_notification": payload["suppress_notification"],
+        "lease_id": payload.get("lease_id"),
+        "lease_expires_at": payload.get("lease_expires_at"),
     }
 
 

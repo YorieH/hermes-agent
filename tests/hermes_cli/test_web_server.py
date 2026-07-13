@@ -391,6 +391,39 @@ class TestWebServerEndpoints:
         assert drain_control.drain_notification_suppressed() is False
         drain_control.clear_drain_request()
 
+    def test_gateway_drain_owner_lease_passthrough(self):
+        from gateway import drain_control
+        from gateway.status import get_process_start_time
+
+        owner_pid = os.getpid()
+        owner_start = get_process_start_time(owner_pid)
+        resp = self.client.post(
+            "/api/gateway/drain",
+            json={
+                "action": "drain",
+                "lease_seconds": 60,
+                "owner_pid": owner_pid,
+                "owner_start_time": owner_start,
+            },
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        body = drain_control.read_drain_request()
+        assert data["lease_id"] == body["lease_id"]
+        assert data["lease_expires_at"] == body["lease_expires_at"]
+        assert body["owner_pid"] == owner_pid
+        if owner_start is not None:
+            assert body["owner_start_time"] == owner_start
+        drain_control.clear_drain_request()
+
+    def test_gateway_drain_rejects_invalid_lease(self):
+        resp = self.client.post(
+            "/api/gateway/drain",
+            json={"action": "drain", "lease_seconds": "not-a-number"},
+        )
+        assert resp.status_code == 400
+
     def test_gateway_drain_cancel_removes_marker(self):
         from gateway import drain_control
 

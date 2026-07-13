@@ -12,6 +12,7 @@ Q-B, exercises a real `hermes gateway run`); these lock the unit contract.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -92,6 +93,151 @@ class TestMarkerContract:
 
         data = json.loads(dc.drain_request_path().read_text())
         assert data["action"] == "drain"
+
+
+class TestLeasedDrainSelfHealing:
+    """Automation drains cannot wedge a profile after their helper dies."""
+
+    def test_idle_restart_principal_gets_bounded_default_lease(self, home):
+        payload = dc.write_drain_request(principal="idle-restart:test")
+
+        assert payload["lease_id"]
+        assert payload["lease_expires_at"]
+        expires = datetime.fromisoformat(payload["lease_expires_at"])
+        requested = datetime.fromisoformat(payload["requested_at"])
+        assert timedelta(seconds=1) <= expires - requested <= timedelta(
+            seconds=dc.DEFAULT_IDLE_RESTART_LEASE_SECONDS + 1
+        )
+
+    def test_owner_pid_implies_a_bounded_lease(self, home):
+        payload = dc.write_drain_request(
+            principal="dashboard:helper", owner_pid=4242, owner_start_time=111
+        )
+        assert payload["lease_id"]
+        assert payload["lease_expires_at"]
+
+    def test_expired_lease_is_conditionally_removed_and_released(
+        self, home, monkeypatch
+    ):
+        started = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr(dc, "_utc_now", lambda: started)
+        payload = dc.write_drain_request(
+            principal="idle-restart:expired", lease_seconds=30
+        )
+        monkeypatch.setattr(
+            dc, "_utc_now", lambda: started + timedelta(seconds=31)
+        )
+
+        assert dc.drain_requested() is False
+        assert dc.drain_request_path().exists() is False
+        assert payload["lease_id"]
+
+    def test_expired_lease_no_longer_suppresses_notifications(
+        self, home, monkeypatch
+    ):
+        started = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr(dc, "_utc_now", lambda: started)
+        dc.write_drain_request(
+            principal="idle-restart:expired",
+            suppress_notification=True,
+            lease_seconds=30,
+        )
+        monkeypatch.setattr(
+            dc, "_utc_now", lambda: started + timedelta(seconds=31)
+        )
+
+        assert dc.drain_notification_suppressed() is False
+
+    def test_dead_owner_releases_lease_immediately(self, home, monkeypatch):
+        import gateway.status as status
+
+        dc.write_drain_request(
+            principal="idle-restart:dead",
+            lease_seconds=300,
+            owner_pid=4242,
+            owner_start_time=111,
+        )
+        monkeypatch.setattr(status, "_pid_exists", lambda _pid: False)
+
+        assert dc.drain_requested() is False
+        assert dc.read_drain_request() is None
+
+    def test_reused_owner_pid_releases_lease(self, home, monkeypatch):
+        import gateway.status as status
+
+        dc.write_drain_request(
+            principal="idle-restart:reused",
+            lease_seconds=300,
+            owner_pid=4242,
+            owner_start_time=111,
+        )
+        monkeypatch.setattr(status, "_pid_exists", lambda _pid: True)
+        monkeypatch.setattr(status, "get_process_start_time", lambda _pid: 222)
+
+        assert dc.drain_requested() is False
+        assert dc.read_drain_request() is None
+
+    def test_live_owner_keeps_lease_active(self, home, monkeypatch):
+        import gateway.status as status
+
+        dc.write_drain_request(
+            principal="idle-restart:live",
+            lease_seconds=300,
+            owner_pid=4242,
+            owner_start_time=111,
+        )
+        monkeypatch.setattr(status, "_pid_exists", lambda _pid: True)
+        monkeypatch.setattr(status, "get_process_start_time", lambda _pid: 111)
+
+        assert dc.drain_requested() is True
+        assert dc.drain_request_path().exists() is True
+
+    def test_unleased_operator_marker_does_not_expire(self, home, monkeypatch):
+        started = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        monkeypatch.setattr(dc, "_utc_now", lambda: started)
+        payload = dc.write_drain_request(principal="dashboard:operator")
+        assert "lease_id" not in payload
+        monkeypatch.setattr(dc, "_utc_now", lambda: started + timedelta(days=3650))
+
+        assert dc.drain_requested() is True
+
+    def test_lease_token_prevents_stale_cleanup_of_replacement(
+        self, home, monkeypatch
+    ):
+        started = datetime(2026, 7, 13, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr(dc, "_utc_now", lambda: started)
+        old = dc.write_drain_request(
+            principal="idle-restart:same-principal", lease_seconds=1
+        )
+        monkeypatch.setattr(
+            dc, "_utc_now", lambda: started + timedelta(seconds=2)
+        )
+        real_clear = dc.clear_drain_request
+
+        def replace_before_clear(**_kwargs):
+            dc.write_drain_request(principal="dashboard:replacement")
+            return False
+
+        monkeypatch.setattr(dc, "clear_drain_request", replace_before_clear)
+
+        assert dc.drain_requested() is True
+        latest = dc.read_drain_request()
+        assert latest["principal"] == "dashboard:replacement"
+        assert latest.get("lease_id") != old["lease_id"]
+        monkeypatch.setattr(dc, "clear_drain_request", real_clear)
+
+    def test_conditional_clear_requires_exact_lease_token(self, home):
+        payload = dc.write_drain_request(
+            principal="idle-restart:owned", lease_seconds=300
+        )
+        assert dc.clear_drain_request(
+            expected_principal="idle-restart:owned",
+            expected_lease_id="not-the-owner",
+        ) is False
+        assert dc.clear_drain_request(
+            expected_principal="idle-restart:owned",
+            expected_lease_id=payload["lease_id"],
+        ) is True
 
 
 class TestSuppressNotification:

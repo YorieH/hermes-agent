@@ -46,15 +46,23 @@ epoch check is deliberately **lenient**: it ignores a marker only on a
 *definite* epoch mismatch. A marker with no epoch (legacy/corrupt/contentless),
 or an environment where the epoch cannot be computed (non-Linux, no ``/proc``),
 both degrade to the original presence-only behaviour — never fail-closed.
+
+Automated ``idle-restart:*`` requests additionally carry a bounded lease.
+That closes the host/Windows gap where the instantiation epoch is unavailable:
+if the helper is killed before its cleanup, the gateway releases the expired
+(or definitely dead/reused-PID) lease instead of refusing Telegram turns
+indefinitely. Operator/dashboard/NAS drains remain unleased by default.
 """
 from __future__ import annotations
 
 import functools
 import json
 import logging
+import math
 import time
+import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -65,6 +73,13 @@ _log = logging.getLogger(__name__)
 
 _DRAIN_REQUEST_FILENAME = ".drain_request.json"
 _DRAIN_LOCK_FILENAME = ".drain_request.lock"
+DEFAULT_IDLE_RESTART_LEASE_SECONDS = 5 * 60
+MAX_DRAIN_LEASE_SECONDS = 24 * 60 * 60
+
+
+def _utc_now() -> datetime:
+    """Return an aware UTC timestamp through a testable seam."""
+    return datetime.now(timezone.utc)
 
 
 @functools.lru_cache(maxsize=1)
@@ -180,6 +195,9 @@ def write_drain_request(
     suppress_notification: bool = False,
     home: Optional[Path] = None,
     require_absent: bool = False,
+    lease_seconds: Optional[float] = None,
+    owner_pid: Optional[int] = None,
+    owner_start_time: Optional[int] = None,
 ) -> dict[str, Any]:
     """Write the begin-drain marker. Returns the payload written.
 
@@ -202,13 +220,50 @@ def write_drain_request(
     of which drain causes set the flag lives entirely in the caller (NAS). The
     field defaults False so legacy/operator drains behave exactly as before.
     """
+    # Automated idle-restart helpers are deliberately leased. If such a helper
+    # is killed after acquiring the marker, the gateway must recover instead of
+    # refusing Telegram turns forever. Human/dashboard/NAS drains remain
+    # unleased unless their caller opts in, preserving the operator contract.
+    if lease_seconds is None and (
+        str(principal).startswith("idle-restart:") or owner_pid is not None
+    ):
+        lease_seconds = DEFAULT_IDLE_RESTART_LEASE_SECONDS
+
+    requested_at = _utc_now()
     payload = {
         "action": "drain",
-        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "requested_at": requested_at.isoformat(),
         "principal": principal,
         "epoch": current_instantiation_epoch(),
         "suppress_notification": bool(suppress_notification),
     }
+    if lease_seconds is not None:
+        seconds = float(lease_seconds)
+        if not math.isfinite(seconds):
+            raise ValueError("lease_seconds must be finite")
+        seconds = min(
+            MAX_DRAIN_LEASE_SECONDS,
+            max(1.0, seconds),
+        )
+        payload["lease_id"] = uuid.uuid4().hex
+        payload["lease_expires_at"] = (
+            requested_at + timedelta(seconds=seconds)
+        ).isoformat()
+
+    if owner_pid is not None:
+        owner_pid = int(owner_pid)
+        if owner_pid <= 0:
+            raise ValueError("owner_pid must be a positive process id")
+        if owner_start_time is None:
+            try:
+                from gateway.status import get_process_start_time
+
+                owner_start_time = get_process_start_time(owner_pid)
+            except Exception:
+                owner_start_time = None
+        payload["owner_pid"] = owner_pid
+        if owner_start_time is not None:
+            payload["owner_start_time"] = int(owner_start_time)
     path = drain_request_path(home)
     with _drain_marker_lock(home=home):
         if require_absent and path.exists():
@@ -218,14 +273,18 @@ def write_drain_request(
 
 
 def clear_drain_request(
-    *, home: Optional[Path] = None, expected_principal: Optional[str] = None
+    *,
+    home: Optional[Path] = None,
+    expected_principal: Optional[str] = None,
+    expected_lease_id: Optional[str] = None,
 ) -> bool:
     """Remove the drain marker (cancel-drain). Returns True if one existed.
 
-    When ``expected_principal`` is supplied, removal is conditional on the
-    current marker still belonging to that principal.  The comparison and
-    unlink share the same cross-process lock as writers, so a helper's cleanup
-    can never erase a newer dashboard/operator drain.
+    When ``expected_principal`` and/or ``expected_lease_id`` is supplied,
+    removal is conditional on the current marker still belonging to that exact
+    owner. The comparison and unlink share the same cross-process lock as
+    writers, so a helper's cleanup can never erase a newer dashboard/operator
+    drain.
 
     Best-effort: a missing file or ownership mismatch is not an error (cancel
     is idempotent). Lock/read/unlink failures remain visible as warnings.
@@ -233,9 +292,19 @@ def clear_drain_request(
     path = drain_request_path(home)
     try:
         with _drain_marker_lock(home=home):
-            if expected_principal is not None:
+            if expected_principal is not None or expected_lease_id is not None:
                 body = _read_drain_request_unlocked(path)
-                if body is None or body.get("principal") != expected_principal:
+                if body is None:
+                    return False
+                if (
+                    expected_principal is not None
+                    and body.get("principal") != expected_principal
+                ):
+                    return False
+                if (
+                    expected_lease_id is not None
+                    and body.get("lease_id") != expected_lease_id
+                ):
                     return False
             path.unlink()
             return True
@@ -267,6 +336,44 @@ def _marker_epoch_is_stale(body: dict[str, Any]) -> bool:
     return marker_epoch != current
 
 
+def _leased_marker_is_stale(body: dict[str, Any]) -> bool:
+    """Return True only when a leased marker is definitely orphaned/expired.
+
+    Invalid or unreadable lease metadata remains active, preserving the
+    existing fail-safe-toward-quiescing behavior. A process-owner mismatch uses
+    both PID and process start time so Windows PID reuse cannot keep an orphaned
+    helper lease alive.
+    """
+    expires_at = body.get("lease_expires_at")
+    if expires_at:
+        try:
+            parsed = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+            if parsed.tzinfo is not None and parsed <= _utc_now():
+                return True
+        except (TypeError, ValueError, OverflowError):
+            pass
+
+    owner_pid = body.get("owner_pid")
+    if owner_pid is None:
+        return False
+    try:
+        owner_pid = int(owner_pid)
+        if owner_pid <= 0:
+            return False
+        from gateway.status import _pid_exists, get_process_start_time
+
+        if not _pid_exists(owner_pid):
+            return True
+        marker_start = body.get("owner_start_time")
+        if marker_start is not None:
+            current_start = get_process_start_time(owner_pid)
+            if current_start is not None and int(marker_start) != int(current_start):
+                return True
+    except Exception:
+        return False
+    return False
+
+
 def drain_requested(*, home: Optional[Path] = None) -> bool:
     """True iff a begin-drain marker for THIS instantiation is present.
 
@@ -283,6 +390,38 @@ def drain_requested(*, home: Optional[Path] = None) -> bool:
         return False
     if _marker_epoch_is_stale(body):
         return False
+    if _leased_marker_is_stale(body):
+        # Leased markers carry a unique ownership token. Conditional cleanup
+        # prevents a stale helper from erasing a newer dashboard/operator drain
+        # that replaced it between our read and unlink.
+        lease_id = body.get("lease_id")
+        if not lease_id:
+            return True
+        released = clear_drain_request(
+            home=home,
+            expected_principal=(
+                str(body.get("principal")) if body.get("principal") is not None else None
+            ),
+            expected_lease_id=str(lease_id),
+        )
+        if released:
+            _log.warning(
+                "drain-control: released stale leased drain %s owned by %s",
+                lease_id,
+                body.get("principal", "unknown"),
+            )
+            return False
+
+        # Ownership changed or cleanup failed. Re-read once and fail safe: a
+        # replacement marker is active, while an absent marker is released.
+        latest = read_drain_request(home=home)
+        if latest is None:
+            return False
+        if latest.get("lease_id") != lease_id:
+            if _marker_epoch_is_stale(latest):
+                return False
+            return True
+        return True
     return True
 
 
@@ -307,6 +446,8 @@ def drain_notification_suppressed(*, home: Optional[Path] = None) -> bool:
     if body is None:
         return False
     if _marker_epoch_is_stale(body):
+        return False
+    if _leased_marker_is_stale(body):
         return False
     return bool(body.get("suppress_notification"))
 
