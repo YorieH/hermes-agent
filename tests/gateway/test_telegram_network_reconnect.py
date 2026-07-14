@@ -8,8 +8,10 @@ rather than silently leaving polling dead.
 
 import ast
 import asyncio
+import importlib
 from pathlib import Path
 import sys
+from types import ModuleType
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -18,7 +20,27 @@ from gateway.config import PlatformConfig
 
 
 def _ensure_telegram_mock():
-    if "telegram" in sys.modules and hasattr(sys.modules["telegram"], "__file__"):
+    existing = sys.modules.get("telegram")
+    if isinstance(existing, ModuleType) and isinstance(
+        getattr(existing, "__file__", None), str
+    ):
+        return
+
+    # Another import-isolation test may have pre-populated these names with a
+    # MagicMock. Remove only those non-module placeholders so an installed PTB
+    # runtime can be imported instead of poisoning later integration tests.
+    for name in ("telegram", "telegram.ext", "telegram.constants", "telegram.request"):
+        if name in sys.modules and not isinstance(sys.modules[name], ModuleType):
+            sys.modules.pop(name)
+
+    try:
+        installed_telegram = importlib.import_module("telegram")
+    except ImportError:
+        installed_telegram = None
+
+    if installed_telegram is not None and isinstance(
+        getattr(installed_telegram, "__file__", None), str
+    ):
         return
 
     telegram_mod = MagicMock()
@@ -35,6 +57,7 @@ def _ensure_telegram_mock():
 
 _ensure_telegram_mock()
 
+from plugins.platforms.telegram import adapter as tg_adapter  # noqa: E402
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
 
 
@@ -48,6 +71,14 @@ def _no_auto_discovery(monkeypatch):
 
 def _make_adapter() -> TelegramAdapter:
     return TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
+
+
+async def _complete_current_polling_generation(adapter: TelegramAdapter) -> None:
+    verifier = adapter._polling_progress_verifier_task
+    adapter._record_polling_progress(adapter._polling_generation)
+    adapter._record_polling_success(adapter._get_polling_generation())
+    if verifier is not None:
+        await verifier
 
 
 @pytest.mark.asyncio
@@ -157,9 +188,9 @@ async def test_reconnect_chained_retry_updates_polling_error_task():
 
 
 @pytest.mark.asyncio
-async def test_reconnect_success_resets_error_count():
+async def test_reconnect_success_waits_for_progress_to_reset_error_count():
     """
-    When start_polling() succeeds, _polling_network_error_count should reset to 0.
+    start_polling() return alone cannot reset the network-error count.
     """
     adapter = _make_adapter()
     adapter._polling_network_error_count = 3
@@ -177,7 +208,12 @@ async def test_reconnect_success_resets_error_count():
     with patch("asyncio.sleep", new_callable=AsyncMock):
         await adapter._handle_polling_network_error(Exception("Bad Gateway"))
 
+    assert adapter._polling_network_error_count == 4
+    assert adapter._send_path_degraded is True
+
+    await _complete_current_polling_generation(adapter)
     assert adapter._polling_network_error_count == 0
+    assert adapter._send_path_degraded is False
 
     # Clean up the heartbeat-probe task scheduled after a successful reconnect.
     pending = [t for t in adapter._background_tasks if not t.done()]
@@ -190,7 +226,7 @@ async def test_reconnect_success_resets_error_count():
 
 
 @pytest.mark.asyncio
-async def test_reconnect_persists_retrying_then_connected_runtime_status():
+async def test_reconnect_waits_for_real_poll_progress_before_connected_status():
     """
     A gateway heartbeat can stay healthy while Telegram polling is reconnecting.
     Persist retrying/connected platform status so external watchdogs can see the
@@ -235,14 +271,21 @@ async def test_reconnect_persists_retrying_then_connected_runtime_status():
         except (asyncio.CancelledError, Exception):
             pass
 
-    with patch("asyncio.sleep", new_callable=AsyncMock):
-        await adapter._verify_polling_after_reconnect()
+    connected_calls_before_progress = [
+        call for call in adapter._write_runtime_status_safe.call_args_list
+        if call.kwargs.get("platform_state") == "connected"
+    ]
+    assert not connected_calls_before_progress, (
+        "a successful getMe probe must not claim that getUpdates polling recovered"
+    )
 
+    adapter._record_polling_progress(adapter._polling_generation)
+    adapter._record_polling_success(adapter._get_polling_generation())
     connected_calls = [
         call for call in adapter._write_runtime_status_safe.call_args_list
         if call.kwargs.get("platform_state") == "connected"
     ]
-    assert connected_calls, "successful heartbeat probe must restore connected state"
+    assert connected_calls, "real getUpdates progress must restore connected state"
     assert connected_calls[-1].kwargs["error_code"] is None
 
 
@@ -320,6 +363,8 @@ async def test_reconnect_drains_polling_request_only():
 
     # Reconnect must still succeed
     mock_app.updater.start_polling.assert_called_once()
+    assert adapter._polling_network_error_count == 2
+    await _complete_current_polling_generation(adapter)
     assert adapter._polling_network_error_count == 0
 
 
@@ -340,6 +385,8 @@ async def test_reconnect_continues_if_drain_fails():
 
     # start_polling must still be called despite drain failure
     mock_app.updater.start_polling.assert_called_once()
+    assert adapter._polling_network_error_count == 2
+    await _complete_current_polling_generation(adapter)
     assert adapter._polling_network_error_count == 0
 
 
@@ -384,7 +431,7 @@ async def test_conflict_retry_also_drains_polling_connections():
 
 
 @pytest.mark.asyncio
-async def test_conflict_retry_persists_retrying_and_connected_runtime_status():
+async def test_conflict_retry_waits_for_real_poll_progress_before_connected_status():
     adapter = _make_adapter()
     adapter._polling_conflict_count = 0
     adapter._write_runtime_status_safe = MagicMock()
@@ -405,6 +452,13 @@ async def test_conflict_retry_persists_retrying_and_connected_runtime_status():
         for call in adapter._write_runtime_status_safe.call_args_list
     ]
     assert "retrying" in states
+    assert "connected" not in states
+
+    await _complete_current_polling_generation(adapter)
+    states = [
+        call.kwargs.get("platform_state")
+        for call in adapter._write_runtime_status_safe.call_args_list
+    ]
     assert "connected" in states
     retry_call = next(
         call
@@ -428,10 +482,9 @@ async def test_drain_helper_noop_without_app():
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_probe_no_op_when_polling_healthy():
+async def test_polling_verifier_exits_on_matching_progress(monkeypatch):
     """
-    Probe scheduled after a successful reconnect: Updater.running=True and
-    bot.get_me() returns quickly → recovery confirmed, no further action.
+    Matching getUpdates progress exits without probing the general path.
     """
     adapter = _make_adapter()
 
@@ -444,19 +497,20 @@ async def test_heartbeat_probe_no_op_when_polling_healthy():
     adapter._app = mock_app
 
     adapter._handle_polling_network_error = AsyncMock()
+    generation, progress = adapter._begin_polling_generation()
+    adapter._record_polling_progress(generation)
+    monkeypatch.setattr(tg_adapter, "_POLLING_PROGRESS_TIMEOUT", 0)
 
-    with patch("asyncio.sleep", new_callable=AsyncMock):
-        await adapter._verify_polling_after_reconnect()
+    await adapter._verify_polling_after_reconnect(generation, progress)
 
-    mock_app.bot.get_me.assert_awaited_once()
+    mock_app.bot.get_me.assert_not_awaited()
     adapter._handle_polling_network_error.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_probe_reenters_ladder_when_updater_not_running():
+async def test_heartbeat_probe_reenters_ladder_when_updater_not_running(monkeypatch):
     """
-    If Updater.running has flipped to False by the heartbeat delay, treat
-    as wedged: re-enter the reconnect ladder.
+    If Updater.running is False at the progress deadline, re-enter recovery.
     """
     adapter = _make_adapter()
 
@@ -469,11 +523,17 @@ async def test_heartbeat_probe_reenters_ladder_when_updater_not_running():
     adapter._app = mock_app
 
     adapter._handle_polling_network_error = AsyncMock()
+    generation, progress = adapter._begin_polling_generation()
+    monkeypatch.setattr(tg_adapter, "_POLLING_PROGRESS_TIMEOUT", 0)
 
-    with patch("asyncio.sleep", new_callable=AsyncMock):
-        await adapter._verify_polling_after_reconnect()
+    await adapter._verify_polling_after_reconnect(generation, progress)
 
     mock_app.bot.get_me.assert_not_called()
+    # Recovery is scheduled through _schedule_polling_recovery (#63243), so
+    # the ladder runs as the tracked _polling_error_task.
+    task = adapter._polling_error_task
+    assert task is not None
+    await task
     adapter._handle_polling_network_error.assert_awaited_once()
     err = adapter._handle_polling_network_error.await_args.args[0]
     assert isinstance(err, RuntimeError)
@@ -481,7 +541,7 @@ async def test_heartbeat_probe_reenters_ladder_when_updater_not_running():
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_probe_reenters_ladder_when_get_me_times_out():
+async def test_heartbeat_probe_reenters_ladder_when_get_me_times_out(monkeypatch):
     """
     If bot.get_me() hangs longer than PROBE_TIMEOUT, treat as wedged.
     Simulates the connection-pool wedge that motivated this fix.
@@ -500,21 +560,25 @@ async def test_heartbeat_probe_reenters_ladder_when_get_me_times_out():
     adapter._app = mock_app
 
     adapter._handle_polling_network_error = AsyncMock()
+    generation, progress = adapter._begin_polling_generation()
+    monkeypatch.setattr(tg_adapter, "_POLLING_PROGRESS_TIMEOUT", 0)
 
     async def fast_wait_for(coro, timeout):
         if asyncio.iscoroutine(coro):
             coro.close()
         raise asyncio.TimeoutError()
 
-    with patch("asyncio.sleep", new_callable=AsyncMock):
-        with patch("plugins.platforms.telegram.adapter.asyncio.wait_for", new=fast_wait_for):
-            await adapter._verify_polling_after_reconnect()
+    with patch("plugins.platforms.telegram.adapter.asyncio.wait_for", new=fast_wait_for):
+        await adapter._verify_polling_after_reconnect(generation, progress)
 
+    task = adapter._polling_error_task
+    assert task is not None
+    await task
     adapter._handle_polling_network_error.assert_awaited_once()
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_probe_reenters_ladder_on_get_me_network_error():
+async def test_heartbeat_probe_reenters_ladder_on_get_me_network_error(monkeypatch):
     """
     Any exception raised by bot.get_me() (NetworkError, ConnectionError, etc.)
     should re-enter the reconnect ladder with the original exception.
@@ -530,10 +594,17 @@ async def test_heartbeat_probe_reenters_ladder_on_get_me_network_error():
     adapter._app = mock_app
 
     adapter._handle_polling_network_error = AsyncMock()
+    generation, progress = adapter._begin_polling_generation()
+    monkeypatch.setattr(tg_adapter, "_POLLING_PROGRESS_TIMEOUT", 0)
 
-    with patch("asyncio.sleep", new_callable=AsyncMock):
-        await adapter._verify_polling_after_reconnect()
+    await adapter._verify_polling_after_reconnect(generation, progress)
 
+    task = adapter._polling_error_task
+    assert task is not None
+    # _schedule_polling_recovery must also register the ladder in
+    # _background_tasks so a failed recovery isn't silently GC'd.
+    assert task in adapter._background_tasks
+    await task
     adapter._handle_polling_network_error.assert_awaited_once()
     assert isinstance(
         adapter._handle_polling_network_error.await_args.args[0], ConnectionError
@@ -541,7 +612,69 @@ async def test_heartbeat_probe_reenters_ladder_on_get_me_network_error():
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_probe_skips_when_already_fatal():
+async def test_heartbeat_probe_ignores_auth_errors(monkeypatch):
+    """
+    Auth/validation failures from the post-reconnect probe must not enter the
+    network-reconnect ladder (#63243): a revoked token would otherwise churn
+    through stop/drain/start_polling cycles that mask the real failure.
+    """
+    adapter = _make_adapter()
+
+    mock_updater = MagicMock()
+    mock_updater.running = True
+
+    # Name-shaped like PTB's InvalidToken; _looks_like_network_error excludes
+    # it by class name, matching real PTB semantics.
+    invalid_token = type("InvalidToken", (Exception,), {})("token revoked")
+
+    mock_app = MagicMock()
+    mock_app.updater = mock_updater
+    mock_app.bot.get_me = AsyncMock(side_effect=invalid_token)
+    adapter._app = mock_app
+
+    adapter._handle_polling_network_error = AsyncMock()
+    generation, progress = adapter._begin_polling_generation()
+    monkeypatch.setattr(tg_adapter, "_POLLING_PROGRESS_TIMEOUT", 0)
+
+    await adapter._verify_polling_after_reconnect(generation, progress)
+
+    assert adapter._polling_error_task is None
+    adapter._handle_polling_network_error.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_probe_defers_to_inflight_recovery(monkeypatch):
+    """
+    A probe failure while another recovery is mid-flight must not start a
+    second concurrent stop/drain/start_polling sequence (#63243) — overlapping
+    recoveries produce dueling getUpdates sessions (self-inflicted 409s).
+    """
+    adapter = _make_adapter()
+
+    mock_updater = MagicMock()
+    mock_updater.running = True
+
+    mock_app = MagicMock()
+    mock_app.updater = mock_updater
+    mock_app.bot.get_me = AsyncMock(side_effect=ConnectionError("pool wedged"))
+    adapter._app = mock_app
+
+    inflight = MagicMock()
+    inflight.done.return_value = False
+    adapter._polling_error_task = inflight
+
+    adapter._handle_polling_network_error = AsyncMock()
+    generation, progress = adapter._begin_polling_generation()
+    monkeypatch.setattr(tg_adapter, "_POLLING_PROGRESS_TIMEOUT", 0)
+
+    await adapter._verify_polling_after_reconnect(generation, progress)
+
+    assert adapter._polling_error_task is inflight
+    adapter._handle_polling_network_error.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_probe_skips_when_already_fatal(monkeypatch):
     """
     If the adapter is already in fatal-error state by the time the probe
     delay elapses, the probe should bail without further action.
@@ -554,9 +687,10 @@ async def test_heartbeat_probe_skips_when_already_fatal():
     adapter._app = mock_app
 
     adapter._handle_polling_network_error = AsyncMock()
+    generation, progress = adapter._begin_polling_generation()
+    monkeypatch.setattr(tg_adapter, "_POLLING_PROGRESS_TIMEOUT", 0)
 
-    with patch("asyncio.sleep", new_callable=AsyncMock):
-        await adapter._verify_polling_after_reconnect()
+    await adapter._verify_polling_after_reconnect(generation, progress)
 
     mock_app.bot.get_me.assert_not_called()
     adapter._handle_polling_network_error.assert_not_awaited()
