@@ -546,12 +546,39 @@ class TestGatewayRuntimeStatus:
         for cmdline in (
             "hermes -p coder gateway run --replace",
             "/opt/hermes/.venv/bin/hermes --profile coder gateway run --replace",
+            "hermes -p=coder gateway run --replace",
+            "hermes --profile=coder gateway run --replace",
             "hermes_home=/opt/data/profiles/coder hermes gateway run --replace",
         ):
             monkeypatch.setattr(status, "_read_process_cmdline", lambda pid, c=cmdline: c)
             assert (
                 status.get_runtime_status_running_pid(payload, expected_home=coder_home)
                 == 139
+            ), cmdline
+
+    def test_runtime_status_running_pid_rejects_profile_name_prefix(self, monkeypatch):
+        """Profile ownership is token-exact, never a substring match."""
+        payload = {
+            "pid": 139,
+            "gateway_state": "running",
+            "kind": "hermes-gateway",
+            "argv": ["hermes", "gateway", "run"],
+            "start_time": 1000,
+        }
+        coder_home = Path("/opt/data/profiles/coder")
+
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: True)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda pid: 1000)
+        for cmdline in (
+            "hermes --profile coder2 gateway run",
+            "hermes -p coder2 gateway run",
+            "hermes --profile=coder2 gateway run",
+            "hermes -p=coder2 gateway run",
+        ):
+            monkeypatch.setattr(status, "_read_process_cmdline", lambda pid, c=cmdline: c)
+            assert (
+                status.get_runtime_status_running_pid(payload, expected_home=coder_home)
+                is None
             ), cmdline
 
     def test_runtime_status_running_pid_default_profile_rejects_named_cmdline(self, monkeypatch):

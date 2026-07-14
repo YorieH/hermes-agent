@@ -84,7 +84,7 @@ def test_run_gateway_refuses_root_in_official_docker(monkeypatch, tmp_path, caps
     (project_root / "docker" / "entrypoint.sh").write_text("#!/bin/sh\n")
 
     monkeypatch.setattr(gateway, "PROJECT_ROOT", project_root)
-    monkeypatch.setattr(gateway.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(gateway.os, "geteuid", lambda: 0, raising=False)
     monkeypatch.delenv("HERMES_ALLOW_ROOT_GATEWAY", raising=False)
     monkeypatch.setattr(gateway, "_is_official_docker_checkout", lambda: True)
 
@@ -106,7 +106,7 @@ def test_run_gateway_root_guard_has_escape_hatch(monkeypatch):
 
     _install_fake_gateway_run(monkeypatch, fake_start_gateway)
     monkeypatch.setattr(gateway.asyncio, "run", lambda coro: True)
-    monkeypatch.setattr(gateway.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(gateway.os, "geteuid", lambda: 0, raising=False)
     monkeypatch.setattr(gateway, "_is_official_docker_checkout", lambda: True)
     monkeypatch.setenv("HERMES_ALLOW_ROOT_GATEWAY", "1")
 
@@ -708,6 +708,7 @@ def test_systemd_status_warns_when_linger_disabled(monkeypatch, tmp_path, capsys
     unit_path.write_text("[Unit]\n")
 
     monkeypatch.setattr(gateway, "get_systemd_unit_path", lambda system=False: unit_path)
+    monkeypatch.setattr(gateway.os, "getuid", lambda: 1000, raising=False)
     monkeypatch.setattr(gateway, "get_systemd_linger_status", lambda: (False, ""))
 
     def fake_run(cmd, capture_output=False, text=False, check=False, **kwargs):
@@ -737,6 +738,7 @@ def test_systemd_install_checks_linger_status(monkeypatch, tmp_path, capsys):
     unit_path = tmp_path / "systemd" / "user" / "hermes-gateway.service"
 
     monkeypatch.setattr(gateway, "get_systemd_unit_path", lambda system=False: unit_path)
+    monkeypatch.setattr(gateway.os, "getuid", lambda: 1000, raising=False)
     # Synthetic unit with a non-temp home: the real generator bakes the
     # hermetic test HERMES_HOME (a tmp dir), which the temp-home write
     # guard correctly refuses.
@@ -873,7 +875,7 @@ def test_install_linux_gateway_from_setup_non_root_never_offers_system(monkeypat
         captured["options"] = options
         return 0  # pick "user"
 
-    monkeypatch.setattr(gateway.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(gateway.os, "geteuid", lambda: 1000, raising=False)
     monkeypatch.setattr(gateway, "prompt_choice", fake_prompt_choice)
     monkeypatch.setattr(gateway, "systemd_install", lambda *a, **k: None)
 
@@ -889,7 +891,7 @@ def test_install_linux_gateway_from_setup_system_choice_without_root_no_sudo_rec
     # Defensive guard: if "system" is forced non-root (not reachable via wizard),
     # we refuse and do NOT print a self-elevation recipe.
     monkeypatch.setattr(gateway, "prompt_linux_gateway_install_scope", lambda: "system")
-    monkeypatch.setattr(gateway.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(gateway.os, "geteuid", lambda: 1000, raising=False)
     monkeypatch.setattr(gateway, "_default_system_service_user", lambda: "alice")
     monkeypatch.setattr(gateway, "systemd_install", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not install")))
 
@@ -903,7 +905,7 @@ def test_install_linux_gateway_from_setup_system_choice_without_root_no_sudo_rec
 
 def test_install_linux_gateway_from_setup_system_choice_as_root_installs(monkeypatch):
     monkeypatch.setattr(gateway, "prompt_linux_gateway_install_scope", lambda: "system")
-    monkeypatch.setattr(gateway.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(gateway.os, "geteuid", lambda: 0, raising=False)
     monkeypatch.setattr(gateway, "_default_system_service_user", lambda: "alice")
 
     calls = []
@@ -1138,6 +1140,7 @@ def test_reap_unsupervised_orphans_noop_on_systemd_hosts(monkeypatch):
 def test_reap_unsupervised_orphans_sigterms_then_sigkills_survivor(monkeypatch):
     """No-systemd: orphan gets SIGTERM, and a survivor is force-killed."""
     monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+    monkeypatch.setattr(gateway.signal, "SIGKILL", 9, raising=False)
     monkeypatch.setattr(gateway, "find_gateway_pids", lambda exclude_pids=None: [708])
     monkeypatch.setattr("gateway.status.write_planned_stop_marker", lambda pid: True)
     # Orphan ignores SIGTERM (matches the field report) and stays alive, so the
@@ -1187,6 +1190,38 @@ def test_scan_gateway_pids_detects_windows_hermes_exe_case_variants(monkeypatch)
     monkeypatch.setattr(gateway.subprocess, "run", fake_run)
 
     assert gateway._scan_gateway_pids(set(), all_profiles=True) == [2468]
+
+
+def test_scan_gateway_pids_scopes_profile_flags_exactly(monkeypatch):
+    """The active scan must not assign coder2's PID to profile coder."""
+    from pathlib import Path
+
+    monkeypatch.setattr(gateway, "is_windows", lambda: True)
+    monkeypatch.setattr(gateway, "_get_ancestor_pids", lambda: set())
+    monkeypatch.setattr(
+        gateway, "get_hermes_home", lambda: Path(r"C:\Hermes\profiles\coder")
+    )
+    monkeypatch.setattr(
+        gateway.shutil, "which", lambda name: "wmic.exe" if name == "wmic" else None
+    )
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:4] == ["wmic.exe", "process", "get", "ProcessId,CommandLine"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "CommandLine=hermes.exe --profile coder2 gateway run\n"
+                    "ProcessId=2468\n\n"
+                    "CommandLine=hermes.exe --profile=coder gateway run\n"
+                    "ProcessId=2469\n\n"
+                ),
+                stderr="",
+            )
+        raise AssertionError(f"Unexpected command: {cmd}")
+
+    monkeypatch.setattr(gateway.subprocess, "run", fake_run)
+
+    assert gateway._scan_gateway_pids(set()) == [2469]
 
 
 # ---------------------------------------------------------------------------

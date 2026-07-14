@@ -4776,6 +4776,52 @@ def test_detect_crashed_workers_nonzero_exit_uses_default_limit(kanban_home):
         conn.close()
 
 
+def test_detect_crashed_workers_systemic_batch_overrides_task_retry_budget(kanban_home):
+    """Three or more identical simultaneous crashes trip every task immediately.
+
+    A systemic fleet failure is not a task-specific flaky attempt. Its
+    deterministic breaker must therefore override even a lenient per-task
+    ``max_retries`` value; otherwise the dispatcher can respawn an entire
+    broken fleet five times before surfacing the shared root cause.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    conn = kb.connect()
+    try:
+        host_prefix = _kb._claimer_id().split(":", 1)[0]
+        task_ids = []
+        for index in range(4):
+            tid = kb.create_task(
+                conn,
+                title=f"systemic-{index}",
+                assignee="worker",
+                max_retries=5,
+            )
+            assert kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock")
+            fake_pid = 994000 + index
+            kb._set_worker_pid(conn, tid, fake_pid)
+            _kb._record_worker_exit(fake_pid, 256)
+            task_ids.append(tid)
+
+        original_alive = _kb._pid_alive
+        _kb._pid_alive = lambda _pid: False
+        try:
+            crashed = kb.detect_crashed_workers(conn)
+        finally:
+            _kb._pid_alive = original_alive
+
+        assert set(crashed) == set(task_ids)
+        assert set(_kb.detect_crashed_workers._last_auto_blocked) == set(task_ids)
+        for tid in task_ids:
+            task = kb.get_task(conn, tid)
+            assert task.status == "blocked"
+            assert task.consecutive_failures == 1
+            kinds = [event.kind for event in kb.list_events(conn, tid)]
+            assert kinds.count("gave_up") == 1
+    finally:
+        conn.close()
+
+
 def test_reclaim_task_clears_failure_counter(kanban_home):
     """Operator reclaim wipes the counter so the next retry gets a fresh
     budget."""

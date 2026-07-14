@@ -2187,6 +2187,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=drop_pending_updates,
                     error_callback=_generation_error_callback,
+                    timeout=_TELEGRAM_LONG_POLL_TIMEOUT,
                 ),
                 timeout=_UPDATER_START_TIMEOUT,
             )

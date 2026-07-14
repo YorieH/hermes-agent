@@ -358,17 +358,51 @@ def _command_line_belongs_to_profile(command: str, profile_home: Path) -> bool:
     explicit ``HERMES_HOME=<path>``) on its argv; the default/root gateway runs
     bare with no profile flag.
     """
-    command_lc = command.lower()
-    command_path_lc = command_lc.replace("\\", "/")
+    try:
+        raw_tokens = shlex.split(command, posix=False)
+    except ValueError:
+        raw_tokens = command.split()
+    tokens = [token.strip("\"'") for token in raw_tokens]
+
+    profile_selectors: list[str] = []
+    explicit_homes: list[str] = []
+    skip_next = False
+    for index, token in enumerate(tokens):
+        if skip_next:
+            skip_next = False
+            continue
+        token_lc = token.lower()
+        if token_lc in ("--profile", "-p"):
+            if index + 1 < len(tokens):
+                profile_selectors.append(tokens[index + 1].strip("\"'").lower())
+                skip_next = True
+            continue
+        if token_lc.startswith("--profile=") or token_lc.startswith("-p="):
+            profile_selectors.append(
+                token.split("=", 1)[1].strip("\"'").lower()
+            )
+            continue
+        if token_lc.startswith("hermes_home="):
+            explicit_homes.append(
+                token.split("=", 1)[1]
+                .strip("\"'")
+                .replace("\\", "/")
+                .rstrip("/")
+                .lower()
+            )
+
     profile_name = _profile_name_for_home(profile_home)
-    home_lc = str(profile_home).lower().replace("\\", "/")
+    home_lc = str(profile_home).replace("\\", "/").rstrip("/").lower()
 
     if profile_name is not None and profile_name != "default":
         profile_lc = profile_name.lower()
-        return (
-            f"--profile {profile_lc}" in command_lc
-            or f"-p {profile_lc}" in command_lc
-            or f"hermes_home={home_lc}" in command_path_lc
+        if profile_selectors:
+            # Require every selector to agree. Besides rejecting prefix
+            # collisions (``kurumi`` vs ``kurumi2``), this fails closed on a
+            # malformed command line containing contradictory profile flags.
+            return all(value == profile_lc for value in profile_selectors)
+        return bool(explicit_homes) and all(
+            value == home_lc for value in explicit_homes
         )
 
     # Default/root profile: the gateway runs with no profile flag. Accept unless
@@ -376,14 +410,9 @@ def _command_line_belongs_to_profile(command: str, profile_home: Path) -> bool:
     # a non-matching explicit HERMES_HOME= on the argv. HERMES_HOME is usually
     # passed via the environment (not visible on the command line), so its mere
     # absence is not disqualifying — only a conflicting explicit value is.
-    if "--profile " in command_lc or " -p " in command_lc:
+    if profile_selectors:
         return False
-    if (
-        "hermes_home=" in command_lc
-        and f"hermes_home={home_lc}" not in command_path_lc
-    ):
-        return False
-    return True
+    return not explicit_homes or all(value == home_lc for value in explicit_homes)
 
 
 def _record_matches_live_gateway_pid(

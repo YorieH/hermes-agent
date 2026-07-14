@@ -351,39 +351,14 @@ def _scan_gateway_pids(
     # unrelated processes like ``python -m tui_gateway``. Lazy import mirrors the
     # circular-import avoidance used elsewhere in this module.
     from gateway.status import (
+        _command_line_belongs_to_profile,
         looks_like_gateway_command_line,
         looks_like_gateway_runtime_command_line,
     )
-    current_home = str(get_hermes_home().resolve())
-    current_home_lc = current_home.lower()
-    current_profile_arg = _profile_arg(current_home)
-    current_profile_name = (
-        current_profile_arg.split()[-1] if current_profile_arg else ""
-    )
-    current_profile_name_lc = current_profile_name.lower()
+    current_home = get_hermes_home().resolve()
 
     def _matches_current_profile(command: str) -> bool:
-        command_lc = command.lower()
-        if current_profile_name:
-            return (
-                f"--profile {current_profile_name_lc}" in command_lc
-                or f"-p {current_profile_name_lc}" in command_lc
-                or f"hermes_home={current_home_lc}" in command_lc
-            )
-
-        # Default-profile case: no profile flag in argv. Accept as long as
-        # the command doesn't advertise *some other* profile. HERMES_HOME
-        # may be passed via env (not visible in wmic/CIM command line) so
-        # its absence is NOT disqualifying — only a non-matching explicit
-        # HERMES_HOME= in argv is.
-        if "--profile " in command_lc or " -p " in command_lc:
-            return False
-        if (
-            "hermes_home=" in command_lc
-            and f"hermes_home={current_home_lc}" not in command_lc
-        ):
-            return False
-        return True
+        return _command_line_belongs_to_profile(command, current_home)
 
     def _matches_gateway_runtime(command: str) -> bool:
         if looks_like_gateway_command_line(command):

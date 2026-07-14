@@ -135,6 +135,10 @@ async def test_start_polling_success_path_unaffected(monkeypatch):
     ok = await a._start_polling_resilient(drop_pending_updates=False, error_callback=None)
     assert ok is True
     app.updater.start_polling.assert_awaited_once()
+    assert (
+        app.updater.start_polling.await_args.kwargs["timeout"]
+        == tg_adapter._TELEGRAM_LONG_POLL_TIMEOUT
+    )
 
 
 def test_every_start_polling_call_site_is_time_bounded():
