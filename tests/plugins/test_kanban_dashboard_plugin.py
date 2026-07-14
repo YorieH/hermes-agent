@@ -2468,7 +2468,7 @@ def test_board_tasks_include_latest_summary(client):
 def test_dashboard_done_final_result_section_rendered_from_summary():
     """Frontend must render Final Result section from run summary when task.result is empty."""
     repo_root = Path(__file__).resolve().parents[2]
-    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text(encoding="utf-8")
     assert "t.result || t.latest_summary" in dist
     assert "Final Result (run summary)" in dist
     assert "No final result was recorded" in dist
@@ -2502,7 +2502,7 @@ def test_task_detail_includes_child_result_summaries(client):
 def test_dashboard_final_result_uses_existing_fields_without_alias():
     """The drawer should not duplicate result/summary into another API field."""
     repo_root = Path(__file__).resolve().parents[2]
-    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text(encoding="utf-8")
     api = (repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py").read_text()
 
     assert "var finalResult = t.result || t.latest_summary || null;" in dist
@@ -2513,7 +2513,7 @@ def test_dashboard_final_result_uses_existing_fields_without_alias():
 def test_dashboard_parent_notice_and_child_results_use_detail_links():
     """Parent detection must use links.children, which exists in task detail."""
     repo_root = Path(__file__).resolve().parents[2]
-    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text()
+    dist = (repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js").read_text(encoding="utf-8")
     detail = dist[dist.index("function TaskDetail"):]
 
     assert "links.children.length > 0" in detail
