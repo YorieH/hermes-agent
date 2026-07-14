@@ -1014,6 +1014,11 @@ def test_restart_running_profiles_restores_each_profile_once(monkeypatch, tmp_pa
         ready_pids[profile] = {"asuna": 303, "kurumi": 404}[profile]
         return ready_pids[profile]
 
+    def fake_wait_ready(profile_paths, *, timeout_s, interval_s=0.25):
+        assert profile_paths == homes
+        events.append(("wait_ready", timeout_s))
+        return dict(ready_pids)
+
     monkeypatch.setattr(
         gateway_windows, "_write_profile_planned_stop_marker", fake_planned_stop
     )
@@ -1034,7 +1039,7 @@ def test_restart_running_profiles_restores_each_profile_once(monkeypatch, tmp_pa
     monkeypatch.setattr(
         gateway_windows,
         "_wait_for_profile_gateways_ready",
-        lambda profile_paths, timeout_s=15.0: dict(ready_pids),
+        fake_wait_ready,
     )
 
     gateway_windows.restart_running_profiles()
@@ -1048,6 +1053,11 @@ def test_restart_running_profiles_restores_each_profile_once(monkeypatch, tmp_pa
         "kurumi",
     ]
     assert events.count(("wait_absent", (101, 202), 7.0)) == 1
+    # Five-profile Windows fleets have been observed needing about 45 seconds
+    # to restore.  The fleet path must not inherit the single-profile 15s
+    # readiness budget and falsely report an outage while recovery is healthy.
+    ready_wait = next(event[1] for event in events if event[0] == "wait_ready")
+    assert ready_wait >= 60.0
     assert not any(
         (home / "gateway_maintenance.lock").exists() for home in homes.values()
     )

@@ -51,6 +51,11 @@ from hermes_cli._subprocess_compat import (
 # Short timeouts: schtasks occasionally wedges and we don't want to hang forever.
 _SCHTASKS_TIMEOUT_S = 15
 _SCHTASKS_NO_OUTPUT_TIMEOUT_S = 30
+# A multi-profile restart can take materially longer than one gateway start on
+# Windows: every profile has its own interpreter/import path and local
+# watchdogs may restore profiles on staggered checks.  Keep this bounded, but
+# leave enough headroom for a five-profile fleet observed taking about 45s.
+_WINDOWS_FLEET_RESTART_READY_TIMEOUT_S = 60.0
 # Patterns in schtasks stderr that mean "fall back to the Startup folder".
 _FALLBACK_PATTERNS = re.compile(
     r"(access is denied|acceso denegado|přístup byl odepřen|schtasks timed out|schtasks produced no output)",
@@ -1855,7 +1860,10 @@ def _get_profile_gateway_pid(profile_path: Path) -> int | None:
 
 
 def _wait_for_profile_gateways_ready(
-    profiles: dict[str, Path], *, timeout_s: float = 15.0, interval_s: float = 0.25
+    profiles: dict[str, Path],
+    *,
+    timeout_s: float = _WINDOWS_FLEET_RESTART_READY_TIMEOUT_S,
+    interval_s: float = 0.25,
 ) -> dict[str, int]:
     """Wait until every named profile has a distinct verified gateway PID."""
     ready: dict[str, int] = {}
@@ -1990,7 +1998,10 @@ def restart_running_profiles() -> None:
             except Exception as exc:
                 spawn_errors[proc.profile] = str(exc)
 
-        ready = _wait_for_profile_gateways_ready(profile_paths, timeout_s=15.0)
+        ready = _wait_for_profile_gateways_ready(
+            profile_paths,
+            timeout_s=_WINDOWS_FLEET_RESTART_READY_TIMEOUT_S,
+        )
         missing = sorted(set(profile_paths) - set(ready))
         if missing:
             details = []
