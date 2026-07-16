@@ -8,6 +8,41 @@ import pytest
 from hermes_cli import runtime_provider as rp
 
 
+def test_copilot_target_model_override_recomputes_api_mode(monkeypatch):
+    """A fallback/oneshot model must not inherit the primary model's wire API."""
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "copilot",
+            "default": "gpt-5.6-sol",
+            "api_mode": "codex_responses",
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "load_pool",
+        lambda _provider: SimpleNamespace(has_credentials=lambda: False),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_api_key_provider_credentials",
+        lambda _provider: {
+            "provider": "copilot",
+            "api_key": "copilot-test-token",
+            "base_url": "https://api.githubcopilot.com",
+            "source": "test",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(
+        requested="copilot",
+        target_model="gpt-4.1",
+    )
+
+    assert resolved["provider"] == "copilot"
+    assert resolved["api_mode"] == "chat_completions"
+
+
 def test_configured_api_key_provider_without_key_fails_closed(monkeypatch):
     """A saved provider must not resolve as another authenticated provider."""
     monkeypatch.setattr(
