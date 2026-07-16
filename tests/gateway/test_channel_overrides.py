@@ -217,20 +217,24 @@ class TestResolveSessionAgentRuntimePriority:
                  "api_mode": "chat_completions",
              }), \
              patch(
-                 "gateway.run._resolve_runtime_agent_kwargs_for_provider",
-                 return_value={
+                  "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+                  return_value={
                      "provider": "openrouter",
                      "api_key": "k2",
                      "base_url": "https://openrouter.ai/api/v1",
-                     "api_mode": "chat_completions",
-                 },
-             ):
+                      "api_mode": "chat_completions",
+                  },
+             ) as resolve_provider:
             model, runtime = runner._resolve_session_agent_runtime(
                 source=source,
                 user_config={"model": {"default": "global/model"}},
             )
         assert model == "channel/model"
         assert runtime["provider"] == "openrouter"
+        resolve_provider.assert_called_once_with(
+            "openrouter",
+            model="channel/model",
+        )
 
     def test_session_model_beats_channel_override(self):
         runner = object.__new__(GatewayRunner)
@@ -262,8 +266,17 @@ class TestResolveSessionAgentRuntimePriority:
                  "provider": "openrouter",
                  "api_key": "k",
                  "base_url": "https://openrouter.ai/api/v1",
-                 "api_mode": "chat_completions",
-             }):
+                  "api_mode": "chat_completions",
+             }), \
+             patch(
+                 "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+                 return_value={
+                     "provider": "openrouter",
+                     "api_key": "k",
+                     "base_url": "https://openrouter.ai/api/v1",
+                     "api_mode": "chat_completions",
+                 },
+             ):
             model, runtime = runner._resolve_session_agent_runtime(
                 source=source,
                 session_key=session_key,
@@ -297,6 +310,24 @@ class TestResolveSessionAgentRuntimePriority:
                  "api_key": "k",
                  "base_url": "https://api.anthropic.com",
                  "api_mode": "chat_completions",
-             }):
-            model, _runtime = runner._resolve_session_agent_runtime(source=source)
+                 "max_tokens": 2048,
+             }), \
+             patch(
+                 "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+                 return_value={
+                     "provider": "anthropic",
+                     "api_key": "k",
+                     "base_url": "https://api.anthropic.com",
+                     "api_mode": "chat_completions",
+                     "max_tokens": 8192,
+                 },
+             ) as resolve_provider:
+            model, runtime = runner._resolve_session_agent_runtime(source=source)
         assert model == "parent/model"
+        assert runtime["max_tokens"] == 2048
+        resolve_provider.assert_called_once_with(
+            "anthropic",
+            model="parent/model",
+            explicit_api_key="k",
+            explicit_base_url="https://api.anthropic.com",
+        )

@@ -344,7 +344,8 @@ def _copilot_runtime_api_mode(
     try:
         from hermes_cli.models import copilot_model_api_mode
 
-        return copilot_model_api_mode(model_name, api_key=api_key)
+        mode = copilot_model_api_mode(model_name, api_key=api_key)
+        return mode or "chat_completions"
     except Exception:
         return "chat_completions"
 

@@ -70,6 +70,7 @@ def make_agent_and_state():
 def test_acp_real_agent_gets_session_db_for_recall(monkeypatch):
     """ACP sessions persist to SessionDB; recall must receive the same DB handle."""
     captured = {}
+    resolved = {}
     sentinel_db = NoopDb()
 
     class CapturingAgent(FakeAgent):
@@ -94,7 +95,7 @@ def test_acp_real_agent_gets_session_db_for_recall(monkeypatch):
         "hermes_cli.runtime_provider",
         mod(
             "hermes_cli.runtime_provider",
-            resolve_runtime_provider=lambda **_kwargs: {
+            resolve_runtime_provider=lambda **kwargs: resolved.update(kwargs) or {
                 "provider": "p",
                 "api_mode": "chat_completions",
                 "base_url": "u",
@@ -112,6 +113,7 @@ def test_acp_real_agent_gets_session_db_for_recall(monkeypatch):
     assert captured["session_db"] is sentinel_db
     assert captured["platform"] == "acp"
     assert captured["session_id"] == "acp-session"
+    assert resolved["target_model"] == "m"
 
 
 @pytest.mark.asyncio

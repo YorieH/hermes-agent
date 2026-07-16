@@ -9,6 +9,13 @@ from types import SimpleNamespace
 from gateway import status
 
 
+def test_profile_name_for_windows_home_is_host_independent():
+    from pathlib import PurePosixPath
+
+    foreign_windows_path = PurePosixPath(r"C:\Hermes\profiles\coder")
+    assert status._profile_name_for_home(foreign_windows_path) == "coder"
+
+
 class TestGatewayPidState:
     def test_write_pid_file_records_gateway_metadata(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

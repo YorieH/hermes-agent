@@ -172,6 +172,50 @@ def test_runtime_resolution_failure_is_not_sticky(monkeypatch):
     assert shell.agent is not None
 
 
+def test_cli_auth_fallback_resolves_runtime_for_fallback_model(monkeypatch):
+    """The CLI must select Copilot's wire API from the fallback model, not the primary."""
+    cli = _import_cli()
+    calls = []
+
+    def _runtime_resolve(**kwargs):
+        calls.append(dict(kwargs))
+        if len(calls) == 1:
+            raise AuthError("primary token expired")
+        return {
+            "provider": "copilot",
+            "api_mode": "chat_completions",
+            "base_url": "https://api.githubcopilot.com",
+            "api_key": "copilot-token",
+            "source": "oauth",
+        }
+
+    class _DummyAgent:
+        def __init__(self, *args, **kwargs):
+            self.kwargs = kwargs
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        _runtime_resolve,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.format_runtime_provider_error",
+        lambda exc: str(exc),
+    )
+    monkeypatch.setattr(cli, "AIAgent", _DummyAgent)
+
+    shell = cli.HermesCLI(model="gpt-5.6-sol", compact=True, max_turns=1)
+    shell.requested_provider = "openai-codex"
+    shell._fallback_model = [{"provider": "copilot", "model": "gpt-4.1"}]
+
+    assert shell._init_agent() is True
+    assert calls[0]["target_model"] == "gpt-5.6-sol"
+    assert calls[1]["requested"] == "copilot"
+    assert calls[1]["target_model"] == "gpt-4.1"
+    assert shell.model == "gpt-4.1"
+    assert shell.provider == "copilot"
+    assert shell.api_mode == "chat_completions"
+
+
 def test_runtime_resolution_rebuilds_agent_on_routing_change(monkeypatch):
     cli = _import_cli()
 

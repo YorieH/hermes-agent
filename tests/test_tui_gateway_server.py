@@ -4320,7 +4320,7 @@ def test_setup_runtime_check_rejects_empty_runtime_key(monkeypatch):
     monkeypatch.setattr("hermes_cli.main._has_any_provider_configured", lambda: True)
     monkeypatch.setattr(
         "hermes_cli.runtime_provider.resolve_runtime_provider",
-        lambda requested=None: {
+        lambda requested=None, target_model=None: {
             "provider": "openrouter",
             "api_key": "",
             "source": "env/config",
@@ -4337,7 +4337,7 @@ def test_setup_runtime_check_allows_no_key_custom_runtime(monkeypatch):
     monkeypatch.setattr("hermes_cli.main._has_any_provider_configured", lambda: True)
     monkeypatch.setattr(
         "hermes_cli.runtime_provider.resolve_runtime_provider",
-        lambda requested=None: {
+        lambda requested=None, target_model=None: {
             "provider": "custom",
             "api_key": "no-key-required",
             "source": "env/config",
@@ -4354,7 +4354,7 @@ def test_setup_runtime_check_rejects_implicit_bedrock_when_unconfigured(monkeypa
     monkeypatch.setattr("hermes_cli.main._has_any_provider_configured", lambda: False)
     monkeypatch.setattr(
         "hermes_cli.runtime_provider.resolve_runtime_provider",
-        lambda requested=None: {
+        lambda requested=None, target_model=None: {
             "provider": "bedrock",
             "api_key": "aws-sdk",
             "source": "iam-role",
@@ -4398,6 +4398,35 @@ def test_setup_runtime_check_honors_requested_provider(monkeypatch):
     default = server.handle_request({"id": "1", "method": "setup.runtime_check", "params": {}})
     assert default["result"]["ok"] is False
     assert default["result"]["provider"] == "anthropic"
+
+
+def test_setup_runtime_check_honors_requested_model(monkeypatch):
+    monkeypatch.setattr("hermes_cli.main._has_any_provider_configured", lambda: True)
+    captured = {}
+
+    def fake_resolve(**kwargs):
+        captured.update(kwargs)
+        return {
+            "provider": "copilot",
+            "api_key": "copilot-token",
+            "source": "oauth",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        fake_resolve,
+    )
+
+    response = server.handle_request(
+        {
+            "id": "1",
+            "method": "setup.runtime_check",
+            "params": {"provider": "copilot", "model": "gpt-4.1"},
+        }
+    )
+
+    assert response["result"]["ok"] is True
+    assert captured == {"requested": "copilot", "target_model": "gpt-4.1"}
 
 
 def test_complete_slash_drops_removed_provider_alias():

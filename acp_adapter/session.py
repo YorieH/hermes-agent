@@ -627,7 +627,10 @@ class SessionManager:
         }
 
         try:
-            runtime = resolve_runtime_provider(requested=requested_provider or config_provider)
+            runtime = resolve_runtime_provider(
+                requested=requested_provider or config_provider,
+                target_model=kwargs["model"] or None,
+            )
             kwargs.update(
                 {
                     "provider": runtime.get("provider"),

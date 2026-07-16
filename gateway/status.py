@@ -340,8 +340,10 @@ def _profile_name_for_home(profile_home: Path) -> Optional[str]:
     has no such parent, so it maps to the default profile (``None`` here, which
     callers treat as "the bare, flag-less gateway").
     """
-    if profile_home.parent.name == "profiles":
-        return profile_home.name
+    normalized = str(profile_home).replace("\\", "/").rstrip("/")
+    parts = [part for part in normalized.split("/") if part]
+    if len(parts) >= 2 and parts[-2].lower() == "profiles":
+        return parts[-1]
     return None
 
 

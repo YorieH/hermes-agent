@@ -2009,14 +2009,24 @@ def _resolve_runtime_agent_kwargs() -> dict:
     }
 
 
-def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
+def _resolve_runtime_agent_kwargs_for_provider(
+    provider: str,
+    model: Optional[str] = None,
+    explicit_api_key: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+) -> dict:
     """Resolve runtime credentials for a specific provider (e.g. from channel override)."""
     from hermes_cli.runtime_provider import (
         resolve_runtime_provider,
         format_runtime_provider_error,
     )
     try:
-        runtime = resolve_runtime_provider(requested=provider)
+        runtime = resolve_runtime_provider(
+            requested=provider,
+            target_model=model or None,
+            explicit_api_key=explicit_api_key,
+            explicit_base_url=explicit_base_url,
+        )
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
     return {
@@ -2027,6 +2037,7 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
+        "max_tokens": runtime.get("max_output_tokens"),
     }
 
 
@@ -2066,6 +2077,7 @@ def _try_resolve_fallback_provider() -> dict | None:
 
                 runtime = resolve_runtime_provider(
                     requested=entry.get("provider"),
+                    target_model=entry.get("model"),
                     explicit_base_url=entry.get("base_url"),
                     explicit_api_key=resolve_entry_api_key(entry),
                 )
@@ -3968,10 +3980,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if ch:
                 if ch.model:
                     model = ch.model
-                if ch.provider:
-                    runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(
-                        ch.provider
+                effective_provider = ch.provider or (
+                    runtime_kwargs.get("provider") if ch.model else None
+                )
+                if effective_provider:
+                    current_max_tokens = runtime_kwargs.get("max_tokens")
+                    resolver_kwargs: Dict[str, Any] = {}
+                    if not ch.provider:
+                        current_api_key = runtime_kwargs.get("api_key")
+                        current_base_url = runtime_kwargs.get("base_url")
+                        if isinstance(current_api_key, str) and current_api_key:
+                            resolver_kwargs["explicit_api_key"] = current_api_key
+                        if isinstance(current_base_url, str) and current_base_url:
+                            resolver_kwargs["explicit_base_url"] = current_base_url
+                    resolved_runtime = _resolve_runtime_agent_kwargs_for_provider(
+                        effective_provider,
+                        model=model,
+                        **resolver_kwargs,
                     )
+                    if (
+                        not ch.provider
+                        and current_max_tokens is not None
+                    ):
+                        resolved_runtime["max_tokens"] = current_max_tokens
+                    runtime_kwargs = resolved_runtime
                     ch_runtime_model = runtime_kwargs.pop("model", None)
                     # Only adopt the provider's bundled model when the override
                     # did not specify an explicit model.
@@ -16567,7 +16599,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # credential-less override — _resolve_session_agent_runtime falls
             # back to env-based resolution and applies model/provider on top.
             try:
-                runtime = _resolve_runtime_agent_kwargs_for_provider(provider)
+                runtime = _resolve_runtime_agent_kwargs_for_provider(
+                    provider,
+                    model=persisted.get("model"),
+                )
                 override["api_key"] = runtime.get("api_key")
                 override["api_mode"] = runtime.get("api_mode")
                 override["credential_pool"] = runtime.get("credential_pool")

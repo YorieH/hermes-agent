@@ -973,9 +973,10 @@ async def test_heartbeat_ignores_ptb_semantic_errors(pending_probe):
     ],
 )
 def test_network_error_classifier_matches_ptb_semantics(error_name, expected):
-    import telegram.error as telegram_error
-
-    error_type = getattr(telegram_error, error_name)
+    # Keep this valid in the minimal CI slice where python-telegram-bot is an
+    # optional MagicMock shim: the classifier's contract is deliberately based
+    # on PTB exception class names before its optional isinstance checks.
+    error_type = type(error_name, (Exception,), {})
     error = error_type(1) if error_name == "RetryAfter" else error_type(error_name)
     assert TelegramAdapter._looks_like_network_error(error) is expected
 

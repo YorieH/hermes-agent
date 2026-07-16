@@ -1763,22 +1763,41 @@ class APIServerAdapter(BasePlatformAdapter):
             gateway_session_key or session_id
         )
         if route and not session_override:
-            if route.get("provider"):
+            route_provider = route.get("provider")
+            provider_to_resolve = route_provider or (
+                runtime_kwargs.get("provider") if route.get("model") else None
+            )
+            if provider_to_resolve:
                 # Resolve real credentials for the routed provider (mirrors
                 # the channel_overrides path in gateway/run.py) so a route
                 # without an explicit api_key/base_url still gets the right
                 # provider auth instead of the default provider's key.
                 try:
                     from gateway.run import _resolve_runtime_agent_kwargs_for_provider
+                    resolver_kwargs = {}
+                    route_api_key = route.get("api_key")
+                    route_base_url = route.get("base_url")
+                    if not route_provider:
+                        route_api_key = route_api_key or runtime_kwargs.get("api_key")
+                        route_base_url = route_base_url or runtime_kwargs.get("base_url")
+                    if isinstance(route_api_key, str) and route_api_key:
+                        resolver_kwargs["explicit_api_key"] = route_api_key
+                    if isinstance(route_base_url, str) and route_base_url:
+                        resolver_kwargs["explicit_base_url"] = route_base_url
                     provider_kwargs = _resolve_runtime_agent_kwargs_for_provider(
-                        route["provider"]
+                        provider_to_resolve,
+                        model=route.get("model") or model,
+                        **resolver_kwargs,
                     )
                     provider_kwargs.pop("model", None)
                     runtime_kwargs.update(provider_kwargs)
                 except Exception:
                     # Fall back to just switching the provider name; explicit
                     # per-route api_key/base_url below can still complete auth.
-                    runtime_kwargs["provider"] = route["provider"]
+                    if route_provider:
+                        runtime_kwargs["provider"] = route_provider
+                    else:
+                        raise
             if route.get("model"):
                 model = route["model"]
             # Per-route secrets are upstream provider credentials. Never log

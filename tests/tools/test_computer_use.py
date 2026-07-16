@@ -348,6 +348,17 @@ class TestDispatch:
         assert parsed["locked"] is False
         assert "path" in parsed
 
+    def test_desktop_lock_owner_handles_foreign_windows_path(self, monkeypatch):
+        from pathlib import PurePosixPath
+
+        import tools.computer_use.tool as computer_tool
+
+        monkeypatch.setenv("HERMES_HOME", r"C:\profiles\kurumi")
+        # Simulate Linux pathlib semantics while running this suite on Windows.
+        monkeypatch.setattr(computer_tool, "Path", PurePosixPath)
+
+        assert computer_tool._desktop_lock_owner() == "kurumi"
+
     def test_desktop_lock_blocks_other_profile_mutations(self, monkeypatch, noop_backend):
         from tools.computer_use.tool import handle_computer_use
 

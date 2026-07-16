@@ -159,7 +159,10 @@ def _desktop_lock_owner() -> str:
             return value
     home = (os.environ.get("HERMES_HOME") or "").strip()
     if home:
-        name = Path(home).name
+        # A Windows profile path can be inspected by a Linux CI/container
+        # process. pathlib follows the host grammar, so normalize both kinds
+        # of separator before taking the final component.
+        name = home.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
         if name:
             return name
     return f"pid-{os.getpid()}"

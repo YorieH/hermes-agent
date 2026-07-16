@@ -4149,6 +4149,16 @@ class TestModelRoutesAgentCreation:
                 captured.update(kwargs)
 
         _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        resolve_provider = MagicMock(return_value={
+            "provider": "openrouter",
+            "api_key": "sk-route",
+            "base_url": "https://route.example/v1",
+            "api_mode": "responses",
+        })
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+            resolve_provider,
+        )
         adapter = _make_routing_adapter(
             {"alias": {
                 "model": "minimax/minimax-m1",
@@ -4167,6 +4177,13 @@ class TestModelRoutesAgentCreation:
         assert captured["model"] == "minimax/minimax-m1"
         assert captured["api_key"] == "sk-route"
         assert captured["base_url"] == "https://route.example/v1"
+        assert captured["api_mode"] == "responses"
+        resolve_provider.assert_called_once_with(
+            "openrouter",
+            model="minimax/minimax-m1",
+            explicit_api_key="sk-route",
+            explicit_base_url="https://route.example/v1",
+        )
 
     def test_route_provider_resolves_provider_credentials(self, monkeypatch):
         captured = {}
@@ -4176,14 +4193,17 @@ class TestModelRoutesAgentCreation:
                 captured.update(kwargs)
 
         _patch_create_agent_runtime(monkeypatch, captured, FakeAgent)
+        resolve_provider = MagicMock(
+            return_value={
+                "provider": "otherprov",
+                "api_key": "sk-otherprov",
+                "base_url": "https://otherprov.example/v1",
+                "api_mode": "chat_completions",
+            }
+        )
         monkeypatch.setattr(
             "gateway.run._resolve_runtime_agent_kwargs_for_provider",
-            lambda provider: {
-                "provider": provider,
-                "api_key": f"sk-{provider}",
-                "base_url": f"https://{provider}.example/v1",
-                "api_mode": "chat_completions",
-            },
+            resolve_provider,
         )
         adapter = _make_routing_adapter(
             {"alias": {"model": "other/model", "provider": "otherprov"}}
@@ -4196,6 +4216,10 @@ class TestModelRoutesAgentCreation:
         assert captured["model"] == "other/model"
         assert captured["provider"] == "otherprov"
         assert captured["api_key"] == "sk-otherprov"
+        resolve_provider.assert_called_once_with(
+            "otherprov",
+            model="other/model",
+        )
 
     def test_no_route_keeps_global_model(self, monkeypatch):
         captured = {}

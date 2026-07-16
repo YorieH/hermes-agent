@@ -11853,7 +11853,11 @@ def _(rid, params: dict) -> dict:
         from hermes_cli.main import _has_any_provider_configured
 
         requested = str(params.get("provider") or "").strip() or None
-        runtime = resolve_runtime_provider(requested=requested)
+        target_model = str(params.get("model") or "").strip() or None
+        runtime = resolve_runtime_provider(
+            requested=requested,
+            target_model=target_model,
+        )
         provider_configured = bool(_has_any_provider_configured())
         provider = runtime.get("provider") or "provider"
         source = str(runtime.get("source") or "")

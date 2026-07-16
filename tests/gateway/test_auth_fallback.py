@@ -22,15 +22,15 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
 
         monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
 
-        call_count = {"n": 0}
+        calls = []
 
         def _mock_resolve(**kwargs):
-            call_count["n"] += 1
+            calls.append(kwargs)
             # First call = primary path (gateway reads model.provider from
             # config.yaml internally; we simulate the auth failure here).
             # Second call = fallback path with explicit_api_key + explicit_base_url
             # supplied by gateway from fallback_model config.
-            if call_count["n"] == 1:
+            if len(calls) == 1:
                 raise AuthError("Codex token refresh failed with status 401")
             return {
                 "api_key": "fallback-key",
@@ -52,7 +52,8 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
         assert result["provider"] == "openrouter"
         assert result["api_key"] == "fallback-key"
         # Should have been called at least twice (primary + fallback)
-        assert call_count["n"] >= 2
+        assert len(calls) >= 2
+        assert calls[1]["target_model"] == "meta-llama/llama-4-maverick"
 
     def test_auth_error_no_fallback_raises(self, tmp_path, monkeypatch):
         """When primary fails and no fallback configured, RuntimeError is raised."""
@@ -89,7 +90,7 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
 
         def _mock_resolve(**kwargs):
             requested = kwargs.get("requested")
-            calls.append(requested)
+            calls.append((requested, kwargs.get("target_model")))
             if requested == "openrouter":
                 raise RuntimeError("openrouter unavailable")
             return {
@@ -110,6 +111,9 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
 
             result = _try_resolve_fallback_provider()
 
-        assert calls == ["openrouter", "nous"]
+        assert calls == [
+            ("openrouter", "anthropic/claude-sonnet-4.6"),
+            ("nous", "Hermes-4"),
+        ]
         assert result["provider"] == "nous"
         assert result["model"] == "Hermes-4"

@@ -2029,6 +2029,7 @@ class TestRunJobConfigEnvVarExpansion:
         def resolve_runtime(**kwargs):
             requested.append(kwargs.get("requested"))
             if kwargs.get("requested") in (None, "openai-codex"):
+                assert kwargs["target_model"] == "gpt-5.6-sol"
                 # Cron must retain the configured primary provider for drift
                 # comparison even when older/custom AuthError sites omit it.
                 raise AuthError("No Codex credentials stored")

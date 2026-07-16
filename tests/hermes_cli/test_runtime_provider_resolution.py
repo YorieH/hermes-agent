@@ -8,15 +8,28 @@ import pytest
 from hermes_cli import runtime_provider as rp
 
 
-def test_copilot_target_model_override_recomputes_api_mode(monkeypatch):
+@pytest.mark.parametrize(
+    ("configured_model", "configured_mode", "target_model", "expected_mode"),
+    [
+        ("gpt-5.6-sol", "codex_responses", "gpt-4.1", "chat_completions"),
+        ("gpt-4.1", "chat_completions", "gpt-5.6-sol", "codex_responses"),
+    ],
+)
+def test_copilot_target_model_override_recomputes_api_mode(
+    monkeypatch,
+    configured_model,
+    configured_mode,
+    target_model,
+    expected_mode,
+):
     """A fallback/oneshot model must not inherit the primary model's wire API."""
     monkeypatch.setattr(
         rp,
         "_get_model_config",
         lambda: {
             "provider": "copilot",
-            "default": "gpt-5.6-sol",
-            "api_mode": "codex_responses",
+            "default": configured_model,
+            "api_mode": configured_mode,
         },
     )
     monkeypatch.setattr(
@@ -25,7 +38,8 @@ def test_copilot_target_model_override_recomputes_api_mode(monkeypatch):
         lambda _provider: SimpleNamespace(has_credentials=lambda: False),
     )
     monkeypatch.setattr(
-        "hermes_cli.auth.resolve_api_key_provider_credentials",
+        rp,
+        "resolve_api_key_provider_credentials",
         lambda _provider: {
             "provider": "copilot",
             "api_key": "copilot-test-token",
@@ -34,13 +48,25 @@ def test_copilot_target_model_override_recomputes_api_mode(monkeypatch):
         },
     )
 
+    def fake_copilot_model_api_mode(model, *, api_key=None):
+        assert api_key == "copilot-test-token"
+        return {
+            "gpt-4.1": "chat_completions",
+            "gpt-5.6-sol": "codex_responses",
+        }[model]
+
+    monkeypatch.setattr(
+        "hermes_cli.models.copilot_model_api_mode",
+        fake_copilot_model_api_mode,
+    )
+
     resolved = rp.resolve_runtime_provider(
         requested="copilot",
-        target_model="gpt-4.1",
+        target_model=target_model,
     )
 
     assert resolved["provider"] == "copilot"
-    assert resolved["api_mode"] == "chat_completions"
+    assert resolved["api_mode"] == expected_mode
 
 
 def test_configured_api_key_provider_without_key_fails_closed(monkeypatch):
