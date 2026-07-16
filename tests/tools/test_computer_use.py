@@ -2441,7 +2441,9 @@ class TestCaptureAfterExactTarget:
         click_out = computer_use_tool.handle_computer_use({
             "action": "click", "coordinate": [10, 20], "capture_after": True,
         })
-        assert "error" not in json.loads(click_out)
+        click_payload = json.loads(click_out) if isinstance(click_out, str) else click_out
+        assert "error" not in click_payload
+        assert click_payload.get("_multimodal") is True
 
         tool_calls = [call.args for call in session.call_tool.call_args_list]
         gws_calls = [args for name, args in tool_calls if name == "get_window_state"]
