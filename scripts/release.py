@@ -45,6 +45,11 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
 
 # Auto-extracted from noreply emails + manual overrides
 AUTHOR_MAP = {
+    "geoffreybutler94@gmail.com": "geoffreybutler94",  # PR #65283 salvage (preserve routed session on profile rebind)
+    "git@hode.co.uk": "okisdev",  # PR #63970 carried assistant-ui upgrade commit; identity corroborated by public commits under the same email
+    "kappachan533@gmail.com": "HaruHaru83",  # Haru's preserved local Hermes commits
+    "nousbot@nousresearch.com": "nousbot-eng",  # PR #65912 upstream automation commit
+    "theunathi@gmail.com": "UnathiCodex",  # PR #65874 upstream contribution
     "sam7894604@gmail.com": "sam7894604",  # PR #55803 salvage (discord: /reasoning slash choices)
     "bryan@users.noreply.github.com": "hydraxman",  # PR #62028 salvage (copilot xhigh) — regression-test commit authored under a bare-noreply local git identity; PR author is @hydraxman
     "antydizajn@gmail.com": "antydizajn",  # PR #36043 salvage (auxiliary: route custom:<name> through named-provider arm + Palantir Bearer auth)
