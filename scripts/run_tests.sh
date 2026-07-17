@@ -58,8 +58,11 @@ for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agen
   fi
 done
 
-if [ -n "$VENV" ]; then
-  PYTHON="$VENV/bin/python"
+if [ -n "$PYTHON" ]; then
+  # The probe above already selected the platform-correct interpreter path.
+  # Keep Scripts/python.exe on Windows instead of overwriting it with the
+  # Unix-only bin/python layout.
+  :
 elif [ -n "${HERMES_PYTHON:-}" ] && [ -x "$HERMES_PYTHON" ] \
     && "$HERMES_PYTHON" -c 'import pytest' 2>/dev/null; then
   # Guard with an import check: HERMES_PYTHON may point at the RELEASE
