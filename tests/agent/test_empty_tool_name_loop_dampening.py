@@ -135,10 +135,24 @@ def agent_env():
     os.environ["HERMES_HOME"] = os.path.join(test_home, ".hermes")
 
     # Import fresh so the patched conversation_loop is exercised even when the
-    # module was imported earlier in the same worker.
-    for mod in list(sys.modules):
-        if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_"):
-            del sys.modules[mod]
+    # module was imported earlier in the same worker.  Preserve the prior
+    # module graph and restore it in teardown: deleting these process-global
+    # entries without restoration gives later tests different exception-class
+    # identities and stale mocks when this file runs in a larger pytest slice.
+    def _is_agent_module(name: str) -> bool:
+        return (
+            name == "run_agent"
+            or name in {"agent", "tools"}
+            or name.startswith("agent.")
+            or name.startswith("tools.")
+            or name.startswith("hermes_")
+        )
+
+    prior_modules = {
+        name: module for name, module in sys.modules.items() if _is_agent_module(name)
+    }
+    for mod in prior_modules:
+        del sys.modules[mod]
     from run_agent import AIAgent
 
     agent = AIAgent(
@@ -153,12 +167,19 @@ def agent_env():
     try:
         yield agent, _MockHandler
     finally:
+        close = getattr(agent, "close", None)
+        if callable(close):
+            close()
         srv.shutdown()
         shutil.rmtree(test_home, ignore_errors=True)
         if prev_home is None:
             os.environ.pop("HERMES_HOME", None)
         else:
             os.environ["HERMES_HOME"] = prev_home
+        for mod in list(sys.modules):
+            if _is_agent_module(mod):
+                del sys.modules[mod]
+        sys.modules.update(prior_modules)
 
 
 def _tool_results(handler) -> list[str]:
