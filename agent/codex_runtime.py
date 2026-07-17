@@ -287,9 +287,22 @@ def _record_codex_app_server_compaction(
 # therefore deserve a tool_progress bubble pair). The projector lives in
 # agent/transports/codex_event_projector.py — keep these in sync so the
 # tool name shown in the UI matches the name recorded in messages.
+# webSearch is codex's built-in web search tool — it has no projector
+# entry (codex handles it internally) but still deserves a bubble.
 _CODEX_TOOL_ITEM_TYPES = frozenset(
-    {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"}
+    {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"}
 )
+
+# Internal MCP server that wraps Hermes' native tools for codex. When
+# codex calls back through it, the inner dispatch runs in a SEPARATE
+# hermes-tools-mcp-server subprocess that has no access to the parent
+# agent's tool_progress_callback — so the inner call can never surface
+# its own native progress event. The codex-level mcpToolCall event IS
+# the display event for those calls; we strip the mcp.hermes-tools.*
+# namespacing and emit the bare tool name (web_search, browser_navigate,
+# vision_analyze, ...) since the user thinks of these as Hermes tools,
+# not as MCP calls.
+_INTERNAL_MCP_SERVER = "hermes-tools"
 
 
 def _codex_item_to_tool_name(item: dict) -> str:
@@ -304,9 +317,13 @@ def _codex_item_to_tool_name(item: dict) -> str:
     if item_type == "mcpToolCall":
         server = item.get("server") or "mcp"
         tool = item.get("tool") or "unknown"
+        if server == _INTERNAL_MCP_SERVER:
+            return tool
         return f"mcp.{server}.{tool}"
     if item_type == "dynamicToolCall":
         return item.get("tool") or "dynamic"
+    if item_type == "webSearch":
+        return "web_search"
     return item_type or "unknown"
 
 
@@ -327,6 +344,8 @@ def _codex_item_to_args(item: dict) -> dict:
     if item_type in {"mcpToolCall", "dynamicToolCall"}:
         args = item.get("arguments") or {}
         return args if isinstance(args, dict) else {"arguments": args}
+    if item_type == "webSearch":
+        return {"query": item.get("query") or ""}
     return {}
 
 
@@ -354,6 +373,9 @@ def _codex_item_to_preview(item: dict) -> Any:
             return json.dumps(args, ensure_ascii=False)[:120]
         except (TypeError, ValueError):
             return None
+    if item_type == "webSearch":
+        query = item.get("query") or ""
+        return query[:120] if query else None
     return None
 
 
@@ -1143,9 +1165,6 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         agent._codex_stream_last_event_ts = time.time()
         agent._touch_activity("receiving stream response")
 
-    def _interrupt_check() -> bool:
-        return bool(agent._interrupt_requested)
-
     for attempt in range(max_stream_retries + 1):
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
@@ -1164,6 +1183,27 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 )
                 continue
             raise
+
+        # Claim the delta sink for THIS attempt (#65991) — parity with the
+        # chat_completions/anthropic/bedrock paths. If a prior attempt's
+        # stream is somehow still alive, this claim supersedes it so its
+        # late deltas are fenced out of the turn; conversely, a newer
+        # attempt supersedes us and the interrupt_check below stops our
+        # consumption immediately.
+        _writer_token = agent._claim_stream_writer()
+
+        def _interrupt_or_superseded(_tok=_writer_token) -> bool:
+            if agent._interrupt_requested:
+                return True
+            if not agent._stream_writer_is_current(_tok):
+                logger.warning(
+                    "Codex streaming attempt superseded by a newer stream; "
+                    "stopping consumption to preserve the single-writer "
+                    "invariant (model=%s).",
+                    api_kwargs.get("model", "unknown"),
+                )
+                return True
+            return False
 
         try:
             # Compatibility: some mocks/providers return a concrete response
@@ -1187,7 +1227,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     ),
                     on_first_delta=on_first_delta,
                     on_event=_on_event,
-                    interrupt_check=_interrupt_check,
+                    interrupt_check=_interrupt_or_superseded,
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
                 if attempt < max_stream_retries:
