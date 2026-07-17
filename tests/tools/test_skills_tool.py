@@ -94,6 +94,17 @@ class TestParseFrontmatter:
         # Should still parse what it can via fallback
         assert "name" in fm
 
+    def test_utf8_bom_frontmatter(self):
+        """A leading UTF-8 BOM (Windows Notepad / PowerShell ``>`` save) must
+        not drop the frontmatter. Confirms the fix reaches the tools/ surface
+        via the _parse_frontmatter re-export."""
+        bom = chr(0xFEFF)
+        content = bom + "---\nname: test\ndescription: A test.\n---\n\n# Body\n"
+        fm, body = _parse_frontmatter(content)
+        assert fm["name"] == "test"
+        assert fm["description"] == "A test."
+        assert not body.startswith(bom)
+
 
 # ---------------------------------------------------------------------------
 # _parse_tags
@@ -413,6 +424,10 @@ class TestSkillView:
         assert f"Run {skill_dir}/scripts/do.sh in session-123" in result["content"]
         assert "${HERMES_SKILL_DIR}" not in result["content"]
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="inline shell expansion requires the POSIX /bin/bash backend",
+    )
     def test_skill_view_applies_inline_shell_when_enabled(self, tmp_path):
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
