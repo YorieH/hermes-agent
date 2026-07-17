@@ -188,8 +188,25 @@ def _file_ext_or_basename(path: str) -> str:
     return base
 
 
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
 def _which(*names: str) -> Optional[str]:
-    """Return the full path of the first command found on PATH."""
+    """Return the first runnable command, preferring native Windows shims."""
+    if _is_windows():
+        # npm exposes both an extensionless POSIX shell shim and a native
+        # ``.cmd`` wrapper.  ``shutil.which(<bare-name>)`` can select the
+        # former on Windows, which then fails in CreateProcess with WinError
+        # 193.  Reuse the installer's native-wrapper-first resolver so the
+        # normal probe path and the post-install path make the same choice.
+        from agent.lsp.install import _existing_binary
+
+        for name in names:
+            path = _existing_binary(name)
+            if path:
+                return path
+        return None
     for n in names:
         path = shutil.which(n)
         if path:

@@ -137,10 +137,8 @@ def _native_binary_candidates(base: Path) -> list[Path]:
 
     # npm installs both an extensionless POSIX shell shim and a native .cmd
     # wrapper. Windows CreateProcess cannot execute the former (WinError 193),
-    # so native wrappers must win whenever both are present.
-    candidates = [Path(str(base) + suffix) for suffix in _WINDOWS_WRAPPER_SUFFIXES]
-    candidates.append(base)
-    return candidates
+    # so never accept the extensionless staging shim as a native executable.
+    return [Path(str(base) + suffix) for suffix in _WINDOWS_WRAPPER_SUFFIXES]
 
 
 def _existing_binary(name: str) -> Optional[str]:
@@ -149,6 +147,13 @@ def _existing_binary(name: str) -> Optional[str]:
         if staged.exists() and os.access(staged, os.X_OK):
             return str(staged)
     if _is_windows():
+        # Older Hermes releases staged only npm's extensionless POSIX shim.
+        # Reuse the already-installed native wrapper directly so an upgrade
+        # repairs discovery without another network install.
+        node_bin = hermes_lsp_bin_dir().parent / "node_modules" / ".bin" / name
+        for installed in _native_binary_candidates(node_bin):
+            if installed.exists() and os.access(installed, os.X_OK):
+                return str(installed)
         for suffix in _WINDOWS_WRAPPER_SUFFIXES:
             on_path = shutil.which(f"{name}{suffix}")
             if on_path:

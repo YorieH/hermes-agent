@@ -133,6 +133,31 @@ def test_existing_binary_prefers_windows_wrapper_over_extensionless_npm_shim(
     assert install_mod._existing_binary("typescript-language-server") == str(wrapper)
 
 
+def test_existing_binary_recovers_native_wrapper_from_legacy_node_install(
+    tmp_path, monkeypatch,
+):
+    """A legacy staged POSIX shim must recover from node_modules without npm."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from agent.lsp import install as install_mod
+
+    stale = install_mod.hermes_lsp_bin_dir() / "pyright-langserver"
+    stale.write_text("#!/bin/sh\n")
+    stale.chmod(0o755)
+    node_wrapper = (
+        install_mod.hermes_lsp_bin_dir().parent
+        / "node_modules" / ".bin" / "pyright-langserver.cmd"
+    )
+    node_wrapper.parent.mkdir(parents=True)
+    node_wrapper.write_text("@echo off\n")
+    node_wrapper.chmod(0o755)
+
+    monkeypatch.setattr(install_mod, "_is_windows", lambda: True)
+    monkeypatch.setattr(install_mod.shutil, "which", lambda _name: None)
+
+    assert install_mod._existing_binary("pyright-langserver") == str(node_wrapper)
+
+
 def test_existing_binary_prefers_windows_wrapper_on_path(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
@@ -153,6 +178,31 @@ def test_existing_binary_prefers_windows_wrapper_on_path(tmp_path, monkeypatch):
 
     assert install_mod._existing_binary("pyright-langserver").endswith(".cmd")
     assert calls[0] == "pyright-langserver.cmd"
+
+
+def test_server_probe_uses_native_windows_wrapper_resolver(monkeypatch):
+    """Normal server discovery must not bypass the native-wrapper preference."""
+    from agent.lsp import install as install_mod
+    from agent.lsp import servers
+
+    calls = []
+
+    def existing(name):
+        calls.append(name)
+        if name == "pyright-langserver":
+            return r"C:\npm\pyright-langserver.cmd"
+        return None
+
+    monkeypatch.setattr(servers, "_is_windows", lambda: True)
+    monkeypatch.setattr(install_mod, "_existing_binary", existing)
+    monkeypatch.setattr(
+        servers.shutil,
+        "which",
+        lambda _name: pytest.fail("Windows discovery bypassed native resolver"),
+    )
+
+    assert servers._which("pyright-langserver", "pyright").endswith(".cmd")
+    assert calls == ["pyright-langserver"]
 
 
 def test_install_pip_finds_windows_scripts_launcher(tmp_path, monkeypatch):
