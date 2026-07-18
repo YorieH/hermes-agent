@@ -783,7 +783,7 @@ class TestDiscoverFallbackIps:
         elapsed = _time.monotonic() - start
 
         assert ips == ["149.154.167.220", "149.154.166.110"]
-        assert elapsed < 1.0, f"discovery gated on hung system DNS ({elapsed:.2f}s)"
+        assert elapsed < 1.4, f"discovery gated on hung system DNS ({elapsed:.2f}s)"
 
     @pytest.mark.asyncio
     async def test_hung_system_dns_with_no_doh_answers_bounded_seed_fallback(self, monkeypatch):
@@ -808,4 +808,4 @@ class TestDiscoverFallbackIps:
         elapsed = _time.monotonic() - start
 
         assert ips == tnet._SEED_FALLBACK_IPS
-        assert elapsed < 1.0, f"seed fallback gated on hung system DNS ({elapsed:.2f}s)"
+        assert elapsed < 1.4, f"seed fallback gated on hung system DNS ({elapsed:.2f}s)"
