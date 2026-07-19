@@ -11,6 +11,7 @@ exactly as before.
 
 import os
 import tempfile
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -64,8 +65,9 @@ class TestInPlaceCompaction:
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
 
-        with tempfile.TemporaryDirectory() as tmp:
-            db = SessionDB(db_path=Path(tmp) / "t.db")
+        with tempfile.TemporaryDirectory() as tmp, closing(
+            SessionDB(db_path=Path(tmp) / "t.db")
+        ) as db:
             sid = "20260619_120000_aaaaaa"
             _seed(db, sid, "my-research")
             agent = _make_agent(db, sid, in_place=True)
@@ -129,8 +131,9 @@ class TestInPlaceCompaction:
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
 
-        with tempfile.TemporaryDirectory() as tmp:
-            db = SessionDB(db_path=Path(tmp) / "t.db")
+        with tempfile.TemporaryDirectory() as tmp, closing(
+            SessionDB(db_path=Path(tmp) / "t.db")
+        ) as db:
             sid = "20260619_120500_cccccc"
             _seed(db, sid, "alt")
             agent = _make_agent(db, sid, in_place=True)
@@ -149,8 +152,9 @@ class TestInPlaceCompaction:
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
 
-        with tempfile.TemporaryDirectory() as tmp:
-            db = SessionDB(db_path=Path(tmp) / "t.db")
+        with tempfile.TemporaryDirectory() as tmp, closing(
+            SessionDB(db_path=Path(tmp) / "t.db")
+        ) as db:
             _seed(db, "ip_flush", "f")
             agent = _make_agent(db, "ip_flush", in_place=True)
             calls = {"n": 0}
@@ -169,8 +173,9 @@ class TestInPlaceCompaction:
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
 
-        with tempfile.TemporaryDirectory() as tmp:
-            db = SessionDB(db_path=Path(tmp) / "t.db")
+        with tempfile.TemporaryDirectory() as tmp, closing(
+            SessionDB(db_path=Path(tmp) / "t.db")
+        ) as db:
             _seed(db, "rot_flush", "f")
             agent = _make_agent(db, "rot_flush", in_place=False)
             calls = {"n": 0}
@@ -192,8 +197,9 @@ class TestRotationFallbackWhenFlagOff:
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
 
-        with tempfile.TemporaryDirectory() as tmp:
-            db = SessionDB(db_path=Path(tmp) / "t.db")
+        with tempfile.TemporaryDirectory() as tmp, closing(
+            SessionDB(db_path=Path(tmp) / "t.db")
+        ) as db:
             sid = "20260619_130000_bbbbbb"
             _seed(db, sid, "my-research")
             agent = _make_agent(db, sid, in_place=False)
@@ -233,8 +239,9 @@ class TestInPlaceSignalForGateway:
         from hermes_state import SessionDB
         from agent.conversation_compression import compress_context
 
-        with tempfile.TemporaryDirectory() as tmp:
-            db = SessionDB(db_path=Path(tmp) / "t.db")
+        with tempfile.TemporaryDirectory() as tmp, closing(
+            SessionDB(db_path=Path(tmp) / "t.db")
+        ) as db:
             # in-place → flag True
             _seed(db, "s_ip", "ip")
             a_ip = _make_agent(db, "s_ip", in_place=True)
@@ -273,8 +280,9 @@ class TestCompactedTurnsStaySearchable:
     def test_compacted_turns_found_by_default_search(self):
         from hermes_state import SessionDB
 
-        with tempfile.TemporaryDirectory() as tmp:
-            db = SessionDB(db_path=Path(tmp) / "t.db")
+        with tempfile.TemporaryDirectory() as tmp, closing(
+            SessionDB(db_path=Path(tmp) / "t.db")
+        ) as db:
             sid = "20260619_search"
             db.create_session(sid, "cli", model="test/model")
             for r, c in [
@@ -310,8 +318,9 @@ class TestCompactedTurnsStaySearchable:
         search — the distinction the compacted flag preserves."""
         from hermes_state import SessionDB
 
-        with tempfile.TemporaryDirectory() as tmp:
-            db = SessionDB(db_path=Path(tmp) / "t.db")
+        with tempfile.TemporaryDirectory() as tmp, closing(
+            SessionDB(db_path=Path(tmp) / "t.db")
+        ) as db:
             sid = "20260619_undo"
             db.create_session(sid, "cli", model="test/model")
             db.append_message(session_id=sid, role="user", content="ZEBRAWORD remember this")

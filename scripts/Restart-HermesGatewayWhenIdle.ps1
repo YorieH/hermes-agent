@@ -7,6 +7,7 @@ param(
   [ValidateRange(2, 10)][int]$MinimumIdleSamples = 2,
   [ValidateRange(30, 3600)][int]$MaximumStateAgeSeconds = 300,
   [ValidateRange(5, 300)][int]$DrainAcknowledgeTimeoutSeconds = 45,
+  [ValidateRange(30, 300)][int]$RestartCommandTimeoutSeconds = 120,
   [ValidateRange(10, 300)][int]$PostRestartTimeoutSeconds = 60,
   [switch]$DryRun,
   [string]$HermesRoot = (Join-Path $env:LOCALAPPDATA "hermes"),
@@ -31,6 +32,12 @@ $ProfileHome = Join-Path $ProfilesRoot $Profile
 $GuardScript = Join-Path $HermesRoot "scripts\hermes_idle_restart_guard.py"
 $LogDir = Join-Path $HermesRoot "logs"
 $LogPath = Join-Path $LogDir "Restart-HermesGatewayWhenIdle-$Profile.log"
+$DrainLeaseSeconds = (
+  $DrainAcknowledgeTimeoutSeconds +
+  $RestartCommandTimeoutSeconds +
+  (2 * $PostRestartTimeoutSeconds) +
+  120
+)
 
 $TargetBindingEstablished = $false
 
@@ -96,6 +103,51 @@ function Invoke-TargetNativeCommand {
   }
 }
 
+function Invoke-TargetNativeCommandWithTimeout {
+  param(
+    [Parameter(Mandatory=$true)][string]$FilePath,
+    [string[]]$Arguments = @(),
+    [Parameter(Mandatory=$true)][int]$TimeoutSeconds
+  )
+  $hadProfile = Test-Path -LiteralPath Env:HERMES_PROFILE
+  $hadHome = Test-Path -LiteralPath Env:HERMES_HOME
+  $previousProfile = $env:HERMES_PROFILE
+  $previousHome = $env:HERMES_HOME
+  $token = [guid]::NewGuid().ToString('N')
+  $stdoutPath = Join-Path ([IO.Path]::GetTempPath()) "hermes-idle-restart-$token.stdout"
+  $stderrPath = Join-Path ([IO.Path]::GetTempPath()) "hermes-idle-restart-$token.stderr"
+  $process = $null
+  try {
+    $env:HERMES_PROFILE = $Profile
+    $env:HERMES_HOME = $ProfileHome
+    $process = Start-Process -FilePath $FilePath -ArgumentList $Arguments `
+      -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath `
+      -WindowStyle Hidden -PassThru
+    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+      try { $process.Kill() } catch {}
+      try { $process.WaitForExit() } catch {}
+      throw "Native command exceeded its $TimeoutSeconds second safety timeout"
+    }
+    # A second zero-argument wait flushes asynchronous redirected output after
+    # the process handle becomes signaled on Windows PowerShell 5.1.
+    $process.WaitForExit()
+    $stdout = if (Test-Path -LiteralPath $stdoutPath) { @(Get-Content -LiteralPath $stdoutPath -Encoding UTF8) } else { @() }
+    $stderr = if (Test-Path -LiteralPath $stderrPath) { @(Get-Content -LiteralPath $stderrPath -Encoding UTF8) } else { @() }
+    return [pscustomobject]@{
+      Output = @($stdout) + @($stderr)
+      ExitCode = [int]$process.ExitCode
+    }
+  } finally {
+    if ($hadProfile) { $env:HERMES_PROFILE = $previousProfile }
+    else { Remove-Item -LiteralPath Env:HERMES_PROFILE -ErrorAction SilentlyContinue }
+    if ($hadHome) { $env:HERMES_HOME = $previousHome }
+    else { Remove-Item -LiteralPath Env:HERMES_HOME -ErrorAction SilentlyContinue }
+    Remove-Item -LiteralPath $stdoutPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
+    if ($null -ne $process) { $process.Dispose() }
+  }
+}
+
 function Invoke-GuardJson {
   param([string[]]$Arguments)
   $invocation = Invoke-TargetNativeCommand -FilePath $HermesPython -Arguments (@($GuardScript) + $Arguments)
@@ -134,9 +186,9 @@ function Get-IdleSnapshot {
 function Enter-OwnedDrain {
   $null = Invoke-GuardJson -Arguments @(
     "drain-begin", "--home", $ProfileHome, "--principal", $OperationId,
-    "--owner-pid", "$PID"
+    "--owner-pid", "$PID", "--lease-seconds", "$DrainLeaseSeconds"
   )
-  Write-IdleRestartLog "external_drain_claimed profile=$Profile owner_pid=$PID"
+  Write-IdleRestartLog "external_drain_claimed profile=$Profile owner_pid=$PID lease_seconds=$DrainLeaseSeconds"
 }
 
 function Exit-OwnedDrain {
@@ -154,10 +206,21 @@ function Assert-OwnedDrain {
   if ([long]$status.marker.owner_pid -ne [long]$PID) {
     throw "The external drain marker owner PID does not match this operation"
   }
+  if (-not $status.marker.lease_id -or -not $status.marker.lease_expires_at) {
+    throw "The external drain marker is missing its bounded lease"
+  }
+  try { $leaseExpiry = [DateTimeOffset]::Parse([string]$status.marker.lease_expires_at) }
+  catch { throw "The external drain marker has an invalid lease expiry" }
+  if ($leaseExpiry -le [DateTimeOffset]::UtcNow) {
+    throw "The external drain marker lease has expired"
+  }
 }
 
 function Invoke-GracefulProfileRestart {
-  $invocation = Invoke-TargetNativeCommand -FilePath $HermesExecutable -Arguments @("--profile", $Profile, "gateway", "restart")
+  $invocation = Invoke-TargetNativeCommandWithTimeout `
+    -FilePath $HermesExecutable `
+    -Arguments @("--profile", $Profile, "gateway", "restart") `
+    -TimeoutSeconds $RestartCommandTimeoutSeconds
   $output = @($invocation.Output)
   $code = $invocation.ExitCode
   if ($code -ne 0) { throw "Graceful Hermes gateway restart exited $code" }
@@ -172,12 +235,12 @@ function Wait-ForExternalDrainIdle {
   while ((Get-Date) -lt $deadline) {
     try {
       Assert-OwnedDrain
-      $snapshot = Get-IdleSnapshot -AllowedStates @("draining", "running") -ExpectedPid $GatewayPid -ExpectedStartTime $StartTime
+      $snapshot = Get-IdleSnapshot -AllowedStates @("draining") -ExpectedPid $GatewayPid -ExpectedStartTime $StartTime
       $lastProbeError = ""
     } catch {
-      # The gateway observes the external drain marker asynchronously. A probe
-      # can therefore still report "running" after drain-begin. The owned
-      # marker plus repeated idle samples is the authoritative safety gate.
+      # The gateway observes the external drain marker asynchronously. Do not
+      # count idle samples until persisted state proves that it has stopped
+      # accepting new turns by entering "draining".
       $lastProbeError = $_.Exception.Message
       $samples = 0
       Start-Sleep -Seconds 1
@@ -261,11 +324,12 @@ function Invoke-IdleRestartMain {
               $null = Wait-ForExternalDrainIdle -GatewayPid $identity.pid -StartTime $identity.start_time
               Write-IdleRestartLog "external_drain_idle_confirmed profile=$Profile"
               Assert-OwnedDrain
-              $finalIdle = Get-IdleSnapshot -AllowedStates @("draining", "running") -ExpectedPid $identity.pid -ExpectedStartTime $identity.start_time
+              $finalIdle = Get-IdleSnapshot -AllowedStates @("draining") -ExpectedPid $identity.pid -ExpectedStartTime $identity.start_time
               if ($finalIdle.active_agents -ne 0 -or $finalIdle.kanban_busy -ne 0) {
                 throw "The target stopped being idle before the graceful restart"
               }
               Invoke-GracefulProfileRestart
+              Assert-OwnedDrain
               $replacement = Wait-ForReplacement -PriorPid $identity.pid -PriorStartTime $identity.start_time -AllowedStates @("draining", "running")
               Exit-OwnedDrain
               $drainOwned = $false
@@ -291,6 +355,12 @@ function Invoke-IdleRestartMain {
   }
   Write-IdleRestartLog "watch_timeout profile=$Profile"
   return 1
+}
+
+if ($MyInvocation.InvocationName -eq ".") {
+  # Dot-sourcing loads the functions for behavioral tests and operator
+  # diagnostics without starting a restart operation or exiting the caller.
+  return
 }
 
 $mutex = New-Object System.Threading.Mutex($false, "Local\Haru.Hermes.IdleRestart.$Profile")

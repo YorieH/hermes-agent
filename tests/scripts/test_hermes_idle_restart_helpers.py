@@ -1,6 +1,8 @@
 """Behavioral coverage for the Windows Hermes idle-restart helpers."""
 from __future__ import annotations
 
+import importlib.util
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -17,6 +19,11 @@ ROOT = Path(__file__).resolve().parents[2]
 GUARD = ROOT / "scripts" / "hermes_idle_restart_guard.py"
 RESTART_HELPER = ROOT / "scripts" / "Restart-HermesGatewayWhenIdle.ps1"
 
+_GUARD_SPEC = importlib.util.spec_from_file_location("hermes_idle_restart_guard", GUARD)
+assert _GUARD_SPEC is not None and _GUARD_SPEC.loader is not None
+guard_module = importlib.util.module_from_spec(_GUARD_SPEC)
+_GUARD_SPEC.loader.exec_module(guard_module)
+
 
 def _run_guard(home: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -26,6 +33,29 @@ def _run_guard(home: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
         text=True,
         timeout=30,
         check=False,
+    )
+
+
+def test_runtime_executable_accepts_launcher_and_copied_venv_layouts(
+    tmp_path,
+    monkeypatch,
+):
+    scripts = tmp_path / "venv" / "Scripts"
+    base = tmp_path / "base-runtime"
+    unrelated = tmp_path / "unrelated"
+    for directory in (scripts, base, unrelated):
+        directory.mkdir(parents=True)
+        for name in ("python.exe", "pythonw.exe"):
+            (directory / name).write_bytes(b"")
+
+    expected = scripts / "python.exe"
+    monkeypatch.setattr(guard_module.sys, "base_prefix", str(base))
+
+    assert guard_module._runtime_executable_matches(expected, scripts / "pythonw.exe")
+    assert guard_module._runtime_executable_matches(expected, base / "pythonw.exe")
+    assert not guard_module._runtime_executable_matches(
+        expected,
+        unrelated / "pythonw.exe",
     )
 
 
@@ -43,6 +73,8 @@ def test_drain_begin_binds_lease_to_explicit_live_owner(tmp_path):
         principal,
         "--owner-pid",
         str(os.getpid()),
+        "--lease-seconds",
+        "900",
     )
 
     assert begun.returncode == 0, begun.stderr
@@ -50,6 +82,9 @@ def test_drain_begin_binds_lease_to_explicit_live_owner(tmp_path):
     assert payload["owner_pid"] == os.getpid()
     assert payload["owner_start_time"] > 0
     assert payload["principal"] == principal
+    requested = datetime.fromisoformat(payload["requested_at"])
+    expires = datetime.fromisoformat(payload["lease_expires_at"])
+    assert 899 <= (expires - requested).total_seconds() <= 901
     assert drain_requested(home=home) is True
 
     cleared = _run_guard(
@@ -78,6 +113,8 @@ def test_drain_begin_dead_owner_self_releases(tmp_path):
         "idle-restart:test-dead-owner",
         "--owner-pid",
         str(impossible_windows_pid),
+        "--lease-seconds",
+        "900",
     )
 
     assert begun.returncode == 0, begun.stderr
@@ -97,6 +134,8 @@ def test_drain_begin_requires_positive_explicit_owner(tmp_path):
         str(home),
         "--principal",
         "idle-restart:test-missing-owner",
+        "--lease-seconds",
+        "900",
     )
     invalid = _run_guard(
         home,
@@ -107,6 +146,8 @@ def test_drain_begin_requires_positive_explicit_owner(tmp_path):
         "idle-restart:test-invalid-owner",
         "--owner-pid",
         "0",
+        "--lease-seconds",
+        "900",
     )
 
     assert missing.returncode == 2
@@ -204,3 +245,114 @@ print(json.dumps({
     assert completed.returncode == 0, completed.stderr or completed.stdout
     log = (hermes_root / "logs" / "Restart-HermesGatewayWhenIdle-rikku.log")
     assert "dry_run_idle_confirmed profile=rikku" in log.read_text(encoding="utf-8-sig")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows PowerShell helper")
+def test_powershell_requires_drain_ack_and_bounds_native_restart(tmp_path):
+    powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+    if not powershell:
+        pytest.skip("Windows PowerShell is unavailable")
+
+    hermes_root = tmp_path / "hermes"
+    (hermes_root / "profiles" / "rikku").mkdir(parents=True)
+    sleeper = tmp_path / "sleeper.ps1"
+    sleeper.write_text("Start-Sleep -Seconds 10\n", encoding="ascii")
+    harness = tmp_path / "harness.ps1"
+    harness.write_text(
+        r'''
+param($Helper, $Root, $Python, $Shell, $Sleeper)
+. $Helper -Profile rikku -DryRun -HermesRoot $Root `
+  -HermesPython $Python -HermesExecutable $Python `
+  -DrainAcknowledgeTimeoutSeconds 11 `
+  -RestartCommandTimeoutSeconds 31 `
+  -PostRestartTimeoutSeconds 13
+
+if ($DrainLeaseSeconds -ne 188) {
+  throw "unexpected computed lease: $DrainLeaseSeconds"
+}
+
+$script:ProbeStates = New-Object 'System.Collections.Generic.Queue[string]'
+foreach ($state in @('running', 'running', 'draining', 'draining')) {
+  $script:ProbeStates.Enqueue($state)
+}
+$script:ProbeCalls = 0
+function Assert-OwnedDrain {}
+function Get-IdleSnapshot {
+  param(
+    [string[]]$AllowedStates = @('running'),
+    [long]$ExpectedPid = 0,
+    [long]$ExpectedStartTime = 0,
+    [switch]$RequireTelegramConnected
+  )
+  $script:ProbeCalls += 1
+  $state = $script:ProbeStates.Dequeue()
+  if ($AllowedStates -notcontains $state) { throw "state $state not allowed" }
+  return [pscustomobject]@{
+    gateway_state = $state
+    active_agents = 0
+    kanban_busy = 0
+  }
+}
+function Start-Sleep { param([int]$Seconds) }
+
+$ack = Wait-ForExternalDrainIdle -GatewayPid 1234 -StartTime 5678
+if ($ack.gateway_state -ne 'draining' -or $script:ProbeCalls -ne 4) {
+  throw "running samples were incorrectly accepted"
+}
+Remove-Item Function:Start-Sleep
+
+$watch = [Diagnostics.Stopwatch]::StartNew()
+$timedOut = $false
+try {
+  $null = Invoke-TargetNativeCommandWithTimeout `
+    -FilePath $Shell `
+    -Arguments @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Sleeper) `
+    -TimeoutSeconds 1
+} catch {
+  if ($_.Exception.Message -like '*safety timeout*') { $timedOut = $true }
+  else { throw }
+}
+$watch.Stop()
+if (-not $timedOut -or $watch.Elapsed.TotalSeconds -gt 6) {
+  throw "native restart timeout was not enforced"
+}
+
+[pscustomobject]@{
+  drain_state = $ack.gateway_state
+  probe_calls = $script:ProbeCalls
+  lease_seconds = $DrainLeaseSeconds
+  timeout_enforced = $timedOut
+} | ConvertTo-Json -Compress
+'''.lstrip(),
+        encoding="ascii",
+    )
+
+    completed = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(harness),
+            str(RESTART_HELPER),
+            str(hermes_root),
+            sys.executable,
+            powershell,
+            str(sleeper),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+    result = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert result == {
+        "drain_state": "draining",
+        "probe_calls": 4,
+        "lease_seconds": 188,
+        "timeout_enforced": True,
+    }

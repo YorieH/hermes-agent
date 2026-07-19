@@ -38,6 +38,37 @@ def _positive_process_id(value: str) -> int:
     return process_id
 
 
+def _positive_seconds(value: str) -> int:
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("lease seconds must be an integer") from exc
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError("lease seconds must be positive")
+    return seconds
+
+
+def _runtime_executable_matches(expected: Path, live: Path) -> bool:
+    """Accept only the selected venv or its exact base-runtime executables.
+
+    Windows launcher-style virtual environments report the base interpreter
+    through ``psutil.Process.exe()``, while copied virtual environments can
+    report the executable under ``venv\Scripts``. Gateways may use either
+    ``python.exe`` or ``pythonw.exe``. Enumerating those exact files supports
+    both layouts without accepting an arbitrary interpreter in the same tree.
+    """
+    expected = expected.resolve(strict=True)
+    live = live.resolve(strict=True)
+    roots = {expected.parent, Path(sys.base_prefix).resolve(strict=True)}
+    allowed: set[Path] = set()
+    for root in roots:
+        for name in ("python.exe", "pythonw.exe"):
+            candidate = root / name
+            if candidate.is_file():
+                allowed.add(candidate.resolve(strict=True))
+    return live in allowed
+
+
 def _profile_gateway_processes(profile: str) -> list[psutil.Process]:
     matches: list[psutil.Process] = []
     for process in psutil.process_iter(("pid", "exe", "cmdline", "status")):
@@ -174,7 +205,7 @@ def probe(args: argparse.Namespace) -> dict[str, Any]:
         expected_executable != Path(sys.executable).resolve(strict=True)
         or expected_executable.name.lower() not in python_names
         or live_executable.name.lower() not in python_names
-        or live_executable.parent != Path(sys.base_prefix).resolve(strict=True)
+        or not _runtime_executable_matches(expected_executable, live_executable)
     ):
         raise RuntimeError("gateway executable does not match the requested Hermes runtime")
     if process.pid != pid:
@@ -225,6 +256,7 @@ def main(argv: list[str] | None = None) -> int:
     begin.add_argument("--home", type=Path, required=True)
     begin.add_argument("--principal", required=True)
     begin.add_argument("--owner-pid", type=_positive_process_id, required=True)
+    begin.add_argument("--lease-seconds", type=_positive_seconds, required=True)
     clear = subparsers.add_parser("drain-clear")
     clear.add_argument("--home", type=Path, required=True)
     clear.add_argument("--principal", required=True)
@@ -240,6 +272,7 @@ def main(argv: list[str] | None = None) -> int:
                 home=args.home.resolve(strict=True),
                 principal=args.principal,
                 require_absent=True,
+                lease_seconds=args.lease_seconds,
                 owner_pid=args.owner_pid,
             )
         elif args.command == "drain-clear":
