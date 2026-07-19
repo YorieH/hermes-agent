@@ -30,6 +30,8 @@ $HermesPython = [IO.Path]::GetFullPath($HermesPython)
 $HermesExecutable = [IO.Path]::GetFullPath($HermesExecutable)
 $ProfileHome = Join-Path $ProfilesRoot $Profile
 $MaintenancePath = Join-Path $ProfileHome "gateway_maintenance.lock"
+$GatewayCommand = Join-Path $ProfileHome "gateway-service\Hermes_Gateway_$Profile.cmd"
+$CommandShell = Join-Path $env:SystemRoot "System32\cmd.exe"
 $GuardScript = Join-Path $HermesRoot "scripts\hermes_idle_restart_guard.py"
 $LogDir = Join-Path $HermesRoot "logs"
 $LogPath = Join-Path $LogDir "Restart-HermesGatewayWhenIdle-$Profile.log"
@@ -68,6 +70,11 @@ function Assert-LiveTargetBinding {
     throw "Inherited gateway context is forbidden; use Schedule-HermesGatewayRestartWhenIdle.ps1"
   }
   if (-not $DryRun) {
+    foreach ($path in @($GatewayCommand, $CommandShell)) {
+      if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "Required detached gateway launcher is missing"
+      }
+    }
     $expectedRoot = [IO.Path]::GetFullPath($DefaultHermesRoot)
     $expectedPython = [IO.Path]::GetFullPath((Join-Path $expectedRoot "hermes-agent\venv\Scripts\python.exe"))
     $expectedExecutable = [IO.Path]::GetFullPath((Join-Path $expectedRoot "hermes-agent\venv\Scripts\hermes.exe"))
@@ -306,11 +313,11 @@ function Invoke-GracefulProfileRestart {
   }
   Assert-OwnedMaintenance
   $startInvocation = Invoke-TargetNativeCommandWithTimeout `
-    -FilePath $HermesExecutable `
-    -Arguments @("--profile", $Profile, "gateway", "start") `
+    -FilePath $CommandShell `
+    -Arguments @("/d", "/c", "`"$GatewayCommand`"") `
     -TimeoutSeconds $RestartCommandTimeoutSeconds
   if ($startInvocation.ExitCode -ne 0) {
-    throw "Graceful Hermes gateway start exited $($startInvocation.ExitCode)"
+    throw "Detached Hermes gateway launcher exited $($startInvocation.ExitCode)"
   }
   Assert-OwnedMaintenance
   $outputLines = @($stopInvocation.Output).Count + @($startInvocation.Output).Count

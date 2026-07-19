@@ -332,12 +332,24 @@ function Invoke-TargetNativeCommandWithTimeout {
     [string[]]$Arguments = @(),
     [Parameter(Mandatory=$true)][int]$TimeoutSeconds
   )
-  $script:LifecycleCalls += [string]$Arguments[-1]
+  if ($FilePath -eq $HermesExecutable -and [string]$Arguments[-1] -eq 'stop') {
+    $script:LifecycleCalls += 'stop'
+  } elseif (
+    $FilePath -eq $CommandShell -and
+    $Arguments.Count -eq 3 -and
+    $Arguments[0] -eq '/d' -and
+    $Arguments[1] -eq '/c' -and
+    $Arguments[2] -eq "`"$GatewayCommand`""
+  ) {
+    $script:LifecycleCalls += 'wrapper-start'
+  } else {
+    throw "unexpected lifecycle command"
+  }
   return [pscustomobject]@{ Output = @(); ExitCode = 0 }
 }
 Invoke-GracefulProfileRestart
-if (($script:LifecycleCalls -join ',') -ne 'stop,start') {
-  throw "the watchdog-safe lifecycle did not use bounded stop then start"
+if (($script:LifecycleCalls -join ',') -ne 'stop,wrapper-start') {
+  throw "the watchdog-safe lifecycle did not use bounded stop then detached wrapper start"
 }
 Assert-OwnedMaintenance
 Exit-OwnedMaintenance
@@ -401,6 +413,6 @@ Remove-Item -LiteralPath $MaintenancePath -Force
         "lease_seconds": 219,
         "timeout_enforced": True,
         "maintenance_collision_protected": True,
-        "lifecycle_calls": ["stop", "start"],
+        "lifecycle_calls": ["stop", "wrapper-start"],
         "foreign_preserved": True,
     }
