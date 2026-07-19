@@ -2172,7 +2172,19 @@ def merge_pending_message_event(
                 and event.message_type != MessageType.TEXT
             ):
                 existing.message_type = event.message_type
-            _invalidate_pending_stt_cache(existing)
+            if incoming_has_media:
+                _invalidate_pending_stt_cache(existing)
+            elif event.text and hasattr(existing, "_gateway_pending_stt_text"):
+                # A text-only follow-up does not change the audio that produced
+                # the cached transcript. Keep the transcript and one-shot echo
+                # state, but extend the cached prompt so the follow-up is not
+                # lost when the pending event is drained later.
+                cached_text = getattr(existing, "_gateway_pending_stt_text")
+                setattr(
+                    existing,
+                    "_gateway_pending_stt_text",
+                    BasePlatformAdapter._merge_caption(cached_text, event.text),
+                )
             return
 
         if (

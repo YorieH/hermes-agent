@@ -14,7 +14,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+    merge_pending_message_event,
+)
 from plugins.platforms.telegram.adapter import TelegramAdapter
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
@@ -149,6 +155,19 @@ async def test_pending_voice_interrupt_reuses_transcript_and_echo():
             interrupt_transcripts,
         )
 
+        pending = {"telegram:dm:12345": event}
+        text_followup = MessageEvent(
+            text="and keep this detail",
+            message_type=MessageType.TEXT,
+            source=source,
+        )
+        merge_pending_message_event(
+            pending,
+            "telegram:dm:12345",
+            text_followup,
+            merge_text=True,
+        )
+
         drain_text, drain_transcripts = await runner._transcribe_pending_audio_event_once(
             event,
             event.text,
@@ -161,7 +180,7 @@ async def test_pending_voice_interrupt_reuses_transcript_and_echo():
         )
 
     assert interrupt_text == '"hello once"'
-    assert drain_text == interrupt_text
+    assert drain_text == '"hello once"\n\nand keep this detail'
     assert drain_transcripts == interrupt_transcripts == ["hello once"]
     mock_transcribe.assert_called_once_with("/tmp/telegram-voice.ogg")
     adapter.send.assert_awaited_once_with(
@@ -169,6 +188,63 @@ async def test_pending_voice_interrupt_reuses_transcript_and_echo():
         '🎙️ "hello once"',
         metadata=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_new_pending_voice_media_invalidates_cached_transcription():
+    runner = _runner()
+    source = _source()
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.VOICE,
+        source=source,
+        media_urls=["/tmp/telegram-voice-one.ogg"],
+        media_types=["audio/ogg"],
+    )
+
+    def transcribe(path):
+        return {
+            "success": True,
+            "transcript": Path(path).stem,
+            "provider": "mock",
+        }
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        side_effect=transcribe,
+    ) as mock_transcribe:
+        first_text, first_transcripts = await runner._transcribe_pending_audio_event_once(
+            event,
+            event.text,
+        )
+
+        pending = {"telegram:dm:12345": event}
+        new_voice = MessageEvent(
+            text="second clip",
+            message_type=MessageType.VOICE,
+            source=source,
+            media_urls=["/tmp/telegram-voice-two.ogg"],
+            media_types=["audio/ogg"],
+        )
+        merge_pending_message_event(
+            pending,
+            "telegram:dm:12345",
+            new_voice,
+            merge_text=True,
+        )
+
+        assert not hasattr(event, "_gateway_pending_stt_text")
+        assert not hasattr(event, "_gateway_pending_stt_transcripts")
+        second_text, second_transcripts = await runner._transcribe_pending_audio_event_once(
+            event,
+            event.text,
+        )
+
+    assert first_text == '"telegram-voice-one"'
+    assert first_transcripts == ["telegram-voice-one"]
+    assert second_transcripts == ["telegram-voice-one", "telegram-voice-two"]
+    assert "second clip" in second_text
+    assert mock_transcribe.call_count == 3
 
 
 @pytest.mark.asyncio
