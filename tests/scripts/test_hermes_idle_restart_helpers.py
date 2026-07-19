@@ -25,6 +25,12 @@ guard_module = importlib.util.module_from_spec(_GUARD_SPEC)
 _GUARD_SPEC.loader.exec_module(guard_module)
 
 
+def test_idle_restart_defaults_cover_observed_windows_gateway_latency():
+    source = RESTART_HELPER.read_text(encoding="ascii")
+    assert "[int]$DrainAcknowledgeTimeoutSeconds = 120" in source
+    assert "[int]$PostRestartTimeoutSeconds = 180" in source
+
+
 def _run_guard(home: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(GUARD), *arguments],
