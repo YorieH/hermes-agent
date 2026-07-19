@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import shutil
 from unittest.mock import patch
 
 import pytest
@@ -35,7 +36,12 @@ class TestGetHermesHome:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("HERMES_HOME", None)
             home = get_hermes_home()
-            assert home == Path.home() / ".hermes"
+            expected = (
+                Path(os.environ["LOCALAPPDATA"]) / "hermes"
+                if os.name == "nt"
+                else Path.home() / ".hermes"
+            )
+            assert home == expected
 
     def test_env_override(self):
         with patch.dict(os.environ, {"HERMES_HOME": "/custom/path"}):
@@ -631,11 +637,13 @@ class TestSaveEnvValueSecure:
             assert load_env()["TERMINAL_SSH_KEY"] == path
 
             # Shell source must round-trip (this is what the bug broke).
+            shell = shutil.which("sh")
+            assert shell is not None, "a POSIX shell is required for this round-trip test"
             r = subprocess.run(
                 [
                     "env",
                     "-i",
-                    "sh",
+                    shell,
                     "-c",
                     f"set -a; . '{env_path}'; set +a; "
                     f'printf "%s" "$TERMINAL_SSH_KEY"',
@@ -665,11 +673,13 @@ class TestSaveEnvValueSecure:
             assert parsed["TABBY_KEY"] == value
             assert load_env()["TABBY_KEY"] == value
 
+            shell = shutil.which("sh")
+            assert shell is not None, "a POSIX shell is required for this round-trip test"
             r = subprocess.run(
                 [
                     "env",
                     "-i",
-                    "sh",
+                    shell,
                     "-c",
                     f"set -a; . '{env_path}'; set +a; "
                     f'printf "%s" "$TABBY_KEY"',
@@ -2238,5 +2248,4 @@ class TestCodexAppServerAutoConfig:
 
             raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
             assert raw["compression"]["codex_app_server_auto"] == "hermes"
-
 

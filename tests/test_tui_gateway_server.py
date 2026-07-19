@@ -8114,7 +8114,11 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda agent, _session=None: {"model": agent.model},
+    )
 
     def _emit(event, sid, payload=None):
         if event == "message.complete":
