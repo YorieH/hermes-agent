@@ -29,12 +29,13 @@ if (-not $HermesExecutable) {
 $HermesPython = [IO.Path]::GetFullPath($HermesPython)
 $HermesExecutable = [IO.Path]::GetFullPath($HermesExecutable)
 $ProfileHome = Join-Path $ProfilesRoot $Profile
+$MaintenancePath = Join-Path $ProfileHome "gateway_maintenance.lock"
 $GuardScript = Join-Path $HermesRoot "scripts\hermes_idle_restart_guard.py"
 $LogDir = Join-Path $HermesRoot "logs"
 $LogPath = Join-Path $LogDir "Restart-HermesGatewayWhenIdle-$Profile.log"
 $DrainLeaseSeconds = (
   $DrainAcknowledgeTimeoutSeconds +
-  $RestartCommandTimeoutSeconds +
+  (2 * $RestartCommandTimeoutSeconds) +
   (2 * $PostRestartTimeoutSeconds) +
   120
 )
@@ -216,15 +217,104 @@ function Assert-OwnedDrain {
   }
 }
 
+function Enter-OwnedMaintenance {
+  $stream = $null
+  $created = $false
+  $complete = $false
+  try {
+    $stream = [IO.File]::Open(
+      $MaintenancePath,
+      [IO.FileMode]::CreateNew,
+      [IO.FileAccess]::Write,
+      [IO.FileShare]::None
+    )
+    $created = $true
+    $bytes = [Text.Encoding]::UTF8.GetBytes("$OperationId`n")
+    $stream.Write($bytes, 0, $bytes.Length)
+    $stream.Flush($true)
+    $complete = $true
+  } finally {
+    if ($null -ne $stream) { $stream.Dispose() }
+    if ($created -and -not $complete) {
+      Remove-Item -LiteralPath $MaintenancePath -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+
+function Assert-OwnedMaintenance {
+  $stream = $null
+  try {
+    $stream = [IO.File]::Open(
+      $MaintenancePath,
+      [IO.FileMode]::Open,
+      [IO.FileAccess]::ReadWrite,
+      [IO.FileShare]::None
+    )
+    $buffer = New-Object byte[] ([int]$stream.Length)
+    $read = $stream.Read($buffer, 0, $buffer.Length)
+    $content = [Text.Encoding]::UTF8.GetString($buffer, 0, $read).Trim()
+    if ($content -ne $OperationId) {
+      throw "The gateway maintenance marker is no longer owned by this operation"
+    }
+    # Rewrite the same owner token while holding an exclusive handle. This
+    # refreshes LastWriteTimeUtc so the watchdog's 10-minute stale-marker
+    # recovery cannot expire a legitimately slow, but still bounded, restart.
+    $bytes = [Text.Encoding]::UTF8.GetBytes("$OperationId`n")
+    $stream.Position = 0
+    $stream.SetLength(0)
+    $stream.Write($bytes, 0, $bytes.Length)
+    $stream.Flush($true)
+  } finally {
+    if ($null -ne $stream) { $stream.Dispose() }
+  }
+}
+
+function Exit-OwnedMaintenance {
+  if (-not (Test-Path -LiteralPath $MaintenancePath -PathType Leaf)) { return }
+  $claimPath = "$MaintenancePath.$([guid]::NewGuid().ToString('N')).claim"
+  [IO.File]::Move($MaintenancePath, $claimPath)
+  $content = ""
+  try {
+    $content = (Get-Content -LiteralPath $claimPath -Raw -Encoding UTF8).Trim()
+    if ($content -ne $OperationId) {
+      if (-not (Test-Path -LiteralPath $MaintenancePath)) {
+        [IO.File]::Move($claimPath, $MaintenancePath)
+      }
+      throw "Refusing to remove a gateway maintenance marker owned by another operation"
+    }
+    Remove-Item -LiteralPath $claimPath -Force
+  } catch {
+    if (
+      (Test-Path -LiteralPath $claimPath) -and
+      -not (Test-Path -LiteralPath $MaintenancePath) -and
+      $content -ne $OperationId
+    ) {
+      try { [IO.File]::Move($claimPath, $MaintenancePath) } catch {}
+    }
+    throw
+  }
+}
+
 function Invoke-GracefulProfileRestart {
-  $invocation = Invoke-TargetNativeCommandWithTimeout `
+  Assert-OwnedMaintenance
+  $stopInvocation = Invoke-TargetNativeCommandWithTimeout `
     -FilePath $HermesExecutable `
-    -Arguments @("--profile", $Profile, "gateway", "restart") `
+    -Arguments @("--profile", $Profile, "gateway", "stop") `
     -TimeoutSeconds $RestartCommandTimeoutSeconds
-  $output = @($invocation.Output)
-  $code = $invocation.ExitCode
-  if ($code -ne 0) { throw "Graceful Hermes gateway restart exited $code" }
-  Write-IdleRestartLog "graceful_restart_command_complete profile=$Profile output_lines=$($output.Count)"
+  if ($stopInvocation.ExitCode -ne 0) {
+    throw "Graceful Hermes gateway stop exited $($stopInvocation.ExitCode)"
+  }
+  Assert-OwnedMaintenance
+  $startInvocation = Invoke-TargetNativeCommandWithTimeout `
+    -FilePath $HermesExecutable `
+    -Arguments @("--profile", $Profile, "gateway", "start") `
+    -TimeoutSeconds $RestartCommandTimeoutSeconds
+  if ($startInvocation.ExitCode -ne 0) {
+    throw "Graceful Hermes gateway start exited $($startInvocation.ExitCode)"
+  }
+  Assert-OwnedMaintenance
+  $outputLines = @($stopInvocation.Output).Count + @($startInvocation.Output).Count
+  Write-IdleRestartLog "graceful_restart_command_complete profile=$Profile output_lines=$outputLines"
 }
 
 function Wait-ForExternalDrainIdle {
@@ -263,6 +353,7 @@ function Wait-ForReplacement {
   $deadline = (Get-Date).AddSeconds($PostRestartTimeoutSeconds)
   while ((Get-Date) -lt $deadline) {
     try {
+      Assert-OwnedMaintenance
       $snapshot = Get-IdleSnapshot -AllowedStates $AllowedStates
       if ($snapshot.pid -ne $PriorPid -or $snapshot.start_time -ne $PriorStartTime) {
         return $snapshot
@@ -280,6 +371,7 @@ function Wait-ForRunningReplacement {
   $deadline = (Get-Date).AddSeconds($PostRestartTimeoutSeconds)
   while ((Get-Date) -lt $deadline) {
     try {
+      Assert-OwnedMaintenance
       return Get-IdleSnapshot -AllowedStates @("running") -ExpectedPid $GatewayPid -ExpectedStartTime $StartTime -RequireTelegramConnected
     } catch {
       Write-IdleRestartLog "running_wait retry=$($_.Exception.GetType().Name)"
@@ -318,6 +410,7 @@ function Invoke-IdleRestartMain {
           } else {
             $disruptiveSequenceStarted = $true
             $drainOwned = $false
+            $maintenanceOwned = $false
             try {
               Enter-OwnedDrain
               $drainOwned = $true
@@ -328,17 +421,26 @@ function Invoke-IdleRestartMain {
               if ($finalIdle.active_agents -ne 0 -or $finalIdle.kanban_busy -ne 0) {
                 throw "The target stopped being idle before the graceful restart"
               }
+              Enter-OwnedMaintenance
+              $maintenanceOwned = $true
+              Write-IdleRestartLog "watchdog_maintenance_claimed profile=$Profile"
               Invoke-GracefulProfileRestart
               Assert-OwnedDrain
               $replacement = Wait-ForReplacement -PriorPid $identity.pid -PriorStartTime $identity.start_time -AllowedStates @("draining", "running")
               Exit-OwnedDrain
               $drainOwned = $false
               $running = Wait-ForRunningReplacement -GatewayPid ([int]$replacement.pid) -StartTime ([long]$replacement.start_time)
+              Exit-OwnedMaintenance
+              $maintenanceOwned = $false
+              Write-IdleRestartLog "watchdog_maintenance_released profile=$Profile"
               Write-IdleRestartLog "watch_complete profile=$Profile new_pid=$($running.pid) telegram=$($running.telegram_state)"
               return 0
             } finally {
               if ($drainOwned) {
                 try { Exit-OwnedDrain } catch { Write-IdleRestartLog "critical_owned_drain_release_failed type=$($_.Exception.GetType().Name)" }
+              }
+              if ($maintenanceOwned) {
+                try { Exit-OwnedMaintenance } catch { Write-IdleRestartLog "critical_owned_maintenance_release_failed type=$($_.Exception.GetType().Name)" }
               }
             }
           }

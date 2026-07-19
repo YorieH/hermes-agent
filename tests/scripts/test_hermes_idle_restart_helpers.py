@@ -267,7 +267,7 @@ param($Helper, $Root, $Python, $Shell, $Sleeper)
   -RestartCommandTimeoutSeconds 31 `
   -PostRestartTimeoutSeconds 13
 
-if ($DrainLeaseSeconds -ne 188) {
+if ($DrainLeaseSeconds -ne 219) {
   throw "unexpected computed lease: $DrainLeaseSeconds"
 }
 
@@ -317,11 +317,56 @@ if (-not $timedOut -or $watch.Elapsed.TotalSeconds -gt 6) {
   throw "native restart timeout was not enforced"
 }
 
+Enter-OwnedMaintenance
+$maintenanceCollisionProtected = $false
+try { Enter-OwnedMaintenance }
+catch { $maintenanceCollisionProtected = $true }
+if (-not $maintenanceCollisionProtected) {
+  throw "an existing maintenance owner was overwritten"
+}
+
+$script:LifecycleCalls = @()
+function Invoke-TargetNativeCommandWithTimeout {
+  param(
+    [Parameter(Mandatory=$true)][string]$FilePath,
+    [string[]]$Arguments = @(),
+    [Parameter(Mandatory=$true)][int]$TimeoutSeconds
+  )
+  $script:LifecycleCalls += [string]$Arguments[-1]
+  return [pscustomobject]@{ Output = @(); ExitCode = 0 }
+}
+Invoke-GracefulProfileRestart
+if (($script:LifecycleCalls -join ',') -ne 'stop,start') {
+  throw "the watchdog-safe lifecycle did not use bounded stop then start"
+}
+Assert-OwnedMaintenance
+Exit-OwnedMaintenance
+if (Test-Path -LiteralPath $MaintenancePath) {
+  throw "the owned maintenance marker was not released"
+}
+
+[IO.File]::WriteAllText($MaintenancePath, "foreign-owner`n")
+$foreignPreserved = $false
+try { Exit-OwnedMaintenance }
+catch {
+  $foreignPreserved = (
+    (Test-Path -LiteralPath $MaintenancePath) -and
+    (Get-Content -LiteralPath $MaintenancePath -Raw).Trim() -eq 'foreign-owner'
+  )
+}
+if (-not $foreignPreserved) {
+  throw "a foreign maintenance marker was not preserved"
+}
+Remove-Item -LiteralPath $MaintenancePath -Force
+
 [pscustomobject]@{
   drain_state = $ack.gateway_state
   probe_calls = $script:ProbeCalls
   lease_seconds = $DrainLeaseSeconds
   timeout_enforced = $timedOut
+  maintenance_collision_protected = $maintenanceCollisionProtected
+  lifecycle_calls = $script:LifecycleCalls
+  foreign_preserved = $foreignPreserved
 } | ConvertTo-Json -Compress
 '''.lstrip(),
         encoding="ascii",
@@ -353,6 +398,9 @@ if (-not $timedOut -or $watch.Elapsed.TotalSeconds -gt 6) {
     assert result == {
         "drain_state": "draining",
         "probe_calls": 4,
-        "lease_seconds": 188,
+        "lease_seconds": 219,
         "timeout_enforced": True,
+        "maintenance_collision_protected": True,
+        "lifecycle_calls": ["stop", "start"],
+        "foreign_preserved": True,
     }
