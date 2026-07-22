@@ -3817,6 +3817,63 @@ class TestSessionLifecycle:
             "list_windows", "start_session",
         ]
 
+    def test_explicit_session_revivals_have_independent_generations(self):
+        """Reviving session A never suppresses the required revival for B."""
+        backend = self._backend_with_mock_session()
+        ended_a = {
+            "data": "session 'caller-a' has ended", "images": [],
+            "image_mime_types": [], "structuredContent": None, "isError": True,
+        }
+        ended_b = {
+            "data": "session 'caller-b' has ended", "images": [],
+            "image_mime_types": [], "structuredContent": None, "isError": True,
+        }
+        revived = {
+            "data": "ok", "images": [], "image_mime_types": [],
+            "structuredContent": None, "isError": False,
+        }
+        backend._session.call_tool.side_effect = [
+            ended_a, revived,
+            ended_b, revived,
+        ]
+
+        first = backend.call_tool("click", {"session": "caller-a"})
+        second = backend.call_tool("click", {"session": "caller-b"})
+
+        assert first["isError"] is True and second["isError"] is True
+        assert [call.args[0] for call in backend._session.call_tool.call_args_list] == [
+            "click", "start_session", "click", "start_session",
+        ]
+        assert backend._session.call_tool.call_args_list[1].args[1] == {
+            "session": "caller-a",
+        }
+        assert backend._session.call_tool.call_args_list[3].args[1] == {
+            "session": "caller-b",
+        }
+
+    def test_expired_recording_mutation_preserves_fail_closed_guidance(self):
+        """Typed recording wrappers raise instead of collapsing the error to {}."""
+        import pytest
+
+        backend = self._backend_with_mock_session()
+        ended = {
+            "data": f"session '{backend._session_id}' has ended",
+            "images": [], "image_mime_types": [],
+            "structuredContent": None, "isError": True,
+        }
+        revived = {
+            "data": "ok", "images": [], "image_mime_types": [],
+            "structuredContent": None, "isError": False,
+        }
+        backend._session.call_tool.side_effect = [ended, revived]
+
+        with pytest.raises(RuntimeError, match="not replayed.*Capture fresh state"):
+            backend.start_recording(output_dir="C:/tmp/recording")
+
+        assert [call.args[0] for call in backend._session.call_tool.call_args_list] == [
+            "start_recording", "start_session",
+        ]
+
     def test_unrelated_logical_error_does_not_restart_session(self):
         """Only the exact expired-session class triggers automatic replay."""
         backend = self._backend_with_mock_session()

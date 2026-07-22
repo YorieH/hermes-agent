@@ -1350,7 +1350,9 @@ class CuaDriverBackend(ComputerUseBackend):
         # already revived the shared session instead of racing duplicate
         # start_session calls.
         self._logical_recovery_lock = threading.Lock()
-        self._logical_session_generation = 0
+        self._logical_session_generations: Dict[str, int] = {
+            self._session_id: 0,
+        }
 
     # ── Lifecycle ──────────────────────────────────────────────────
     def start(self) -> None:
@@ -1439,15 +1441,14 @@ class CuaDriverBackend(ComputerUseBackend):
                     if isinstance(nested, str):
                         parts.append(nested)
         message = " ".join(parts)
-        return bool(
-            session_id
-            and re.search(re.escape(session_id), message, re.IGNORECASE)
-            and re.search(
-                r"\bsession\b.*\bhas ended\b",
-                message,
-                re.IGNORECASE | re.DOTALL,
-            )
+        if not session_id:
+            return False
+        pattern = (
+            r"\bsession\s+['\"]?"
+            + re.escape(session_id)
+            + r"['\"]?\s+has ended\b"
         )
+        return bool(re.search(pattern, message, re.IGNORECASE))
 
     @staticmethod
     def _logical_error_message(out: Dict[str, Any]) -> str:
@@ -1486,7 +1487,8 @@ class CuaDriverBackend(ComputerUseBackend):
         """
         payload = dict(args)
         payload.setdefault("session", self._session_id)
-        observed_generation = self._logical_session_generation
+        session_id = str(payload.get("session") or self._session_id)
+        observed_generation = self._logical_session_generations.get(session_id, 0)
 
         def call_once(tool_name: str, tool_args: Dict[str, Any]) -> Dict[str, Any]:
             # Preserve the historical two-argument call shape on normal typed
@@ -1497,7 +1499,6 @@ class CuaDriverBackend(ComputerUseBackend):
             return self._session.call_tool(tool_name, tool_args, timeout=timeout)
 
         out = call_once(name, payload)
-        session_id = str(payload.get("session") or self._session_id)
         if (
             name in {"start_session", "end_session"}
             or not self._logical_session_has_ended(out, session_id)
@@ -1506,7 +1507,8 @@ class CuaDriverBackend(ComputerUseBackend):
 
         self._clear_active_target()
         with self._logical_recovery_lock:
-            if self._logical_session_generation == observed_generation:
+            current_generation = self._logical_session_generations.get(session_id, 0)
+            if current_generation == observed_generation:
                 logger.warning(
                     "cua-driver logical session ended during %s; reviving once",
                     name,
@@ -1520,7 +1522,7 @@ class CuaDriverBackend(ComputerUseBackend):
                         "cua-driver logical session revival failed: "
                         + self._logical_error_message(revived)
                     )
-                self._logical_session_generation += 1
+                self._logical_session_generations[session_id] = current_generation + 1
 
         if not replay_after_revival:
             return {
@@ -2522,6 +2524,11 @@ class CuaDriverBackend(ComputerUseBackend):
             "record_video": bool(record_video),
             "session": self._session_id,
         })
+        if out.get("isError") is True:
+            raise RuntimeError(
+                "cua-driver start_recording failed: "
+                + self._logical_error_message(out)
+            )
         return out.get("structuredContent") or {}
 
     def stop_recording(self) -> Dict[str, Any]:
@@ -2530,6 +2537,11 @@ class CuaDriverBackend(ComputerUseBackend):
         out = self._call_driver_tool("stop_recording", {
             "session": self._session_id,
         })
+        if out.get("isError") is True:
+            raise RuntimeError(
+                "cua-driver stop_recording failed: "
+                + self._logical_error_message(out)
+            )
         return out.get("structuredContent") or {}
 
     def get_recording_state(self) -> Dict[str, Any]:
