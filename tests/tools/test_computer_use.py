@@ -3693,6 +3693,145 @@ class TestSessionLifecycle:
         with patch("tools.lazy_deps.ensure"):
             backend.start()  # must not raise
 
+    def test_expired_logical_session_revives_and_retries_capture_once(self):
+        """A healthy transport with an expired run session heals in-place."""
+        backend = self._backend_with_mock_session()
+        ended = {
+            "data": f"session '{backend._session_id}' has ended; call start_session",
+            "images": [],
+            "image_mime_types": [],
+            "structuredContent": None,
+            "isError": True,
+        }
+        revived = {
+            "data": "ok", "images": [], "image_mime_types": [],
+            "structuredContent": None, "isError": False,
+        }
+        windows = {
+            "data": "", "images": [], "image_mime_types": [],
+            "structuredContent": {"windows": [{
+                "pid": 101,
+                "window_id": 202,
+                "title": "Recovered",
+                "app": "Demo",
+                "bounds": {"x": 0, "y": 0, "width": 800, "height": 600},
+                "z_index": 1,
+            }]},
+            "isError": False,
+        }
+        backend._session.call_tool.side_effect = [ended, revived, windows]
+
+        result = backend.list_windows()
+
+        assert [window["title"] for window in result] == ["Recovered"]
+        assert [call.args[0] for call in backend._session.call_tool.call_args_list] == [
+            "list_windows", "start_session", "list_windows",
+        ]
+        assert backend._session.call_tool.call_args_list[1].args[1] == {
+            "session": backend._session_id,
+        }
+        assert backend._active_pid is None
+        assert backend._active_window_id is None
+
+    def test_expired_logical_session_recovery_is_bounded(self):
+        """A daemon that rejects the retry is not hammered in a loop."""
+        import pytest
+
+        backend = self._backend_with_mock_session()
+        ended = {
+            "data": f"session '{backend._session_id}' has ended",
+            "images": [],
+            "image_mime_types": [],
+            "structuredContent": None,
+            "isError": True,
+        }
+        revived = {
+            "data": "ok", "images": [], "image_mime_types": [],
+            "structuredContent": None, "isError": False,
+        }
+        backend._session.call_tool.side_effect = [ended, revived, ended]
+
+        with pytest.raises(RuntimeError, match="session .* has ended"):
+            backend._call_capture_tool(
+                "list_windows",
+                {"on_screen_only": True, "session": backend._session_id},
+            )
+
+        assert [call.args[0] for call in backend._session.call_tool.call_args_list] == [
+            "list_windows", "start_session", "list_windows",
+        ]
+
+    def test_expired_logical_session_does_not_replay_mutating_action(self):
+        """Revival clears stale targeting and fails closed for side effects."""
+        backend = self._backend_with_mock_session()
+        backend._active_pid = 42
+        backend._active_window_id = 7
+        backend._snapshot_tokens = {3: "stale-token"}
+        backend._session.supports_capability = lambda *_args, **_kwargs: True
+        ended = {
+            "data": f"session '{backend._session_id}' has ended",
+            "images": [], "image_mime_types": [],
+            "structuredContent": None, "isError": True,
+        }
+        revived = {
+            "data": "ok", "images": [], "image_mime_types": [],
+            "structuredContent": None, "isError": False,
+        }
+        backend._session.call_tool.side_effect = [ended, revived]
+
+        result = backend._action("click", {"element_index": 3})
+
+        assert result.ok is False
+        assert "not replayed" in result.message
+        assert [call.args[0] for call in backend._session.call_tool.call_args_list] == [
+            "click", "start_session",
+        ]
+        assert (
+            backend._session.call_tool.call_args_list[0].args[1]["element_token"]
+            == "stale-token"
+        )
+        assert backend._active_pid is None
+        assert backend._active_window_id is None
+        assert backend._snapshot_tokens == {}
+
+    def test_expired_logical_session_surfaces_failed_revival(self):
+        """A rejected start_session is reported without replaying the tool."""
+        import pytest
+
+        backend = self._backend_with_mock_session()
+        ended = {
+            "data": f"session '{backend._session_id}' has ended",
+            "images": [], "image_mime_types": [],
+            "structuredContent": None, "isError": True,
+        }
+        rejected = {
+            "data": "driver refused revival", "images": [],
+            "image_mime_types": [], "structuredContent": None, "isError": True,
+        }
+        backend._session.call_tool.side_effect = [ended, rejected]
+
+        with pytest.raises(RuntimeError, match="revival failed: driver refused revival"):
+            backend.list_windows()
+
+        assert [call.args[0] for call in backend._session.call_tool.call_args_list] == [
+            "list_windows", "start_session",
+        ]
+
+    def test_unrelated_logical_error_does_not_restart_session(self):
+        """Only the exact expired-session class triggers automatic replay."""
+        backend = self._backend_with_mock_session()
+        backend._session.call_tool.return_value = {
+            "data": "permission denied", "images": [], "image_mime_types": [],
+            "structuredContent": None, "isError": True,
+        }
+
+        result = backend._action("click", {"pid": 42, "window_id": 7})
+
+        assert result.ok is False
+        assert [call.args[0] for call in backend._session.call_tool.call_args_list] == [
+            "click",
+        ]
+
 
 class TestCuaToolCoverageExpansion:
     """Audit follow-up: the 20 cua-driver tools previously uncovered by

@@ -10,6 +10,7 @@ import sys
 from typing import Any
 
 import psutil
+import yaml
 
 from gateway.drain_control import (
     clear_drain_request,
@@ -104,7 +105,30 @@ def _profile_gateway_processes(profile: str) -> list[psutil.Process]:
     return matches
 
 
-def _kanban_busy_count(root: Path, profile: str) -> tuple[int, int]:
+def _profile_default_assignee(profile_home: Path) -> str:
+    """Read the dispatcher fallback that owns otherwise-unassigned work."""
+    config_path = profile_home / "config.yaml"
+    try:
+        config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise RuntimeError(f"cannot read profile kanban config: {config_path}") from exc
+    if not isinstance(config, dict):
+        raise RuntimeError(f"profile config must be a YAML mapping: {config_path}")
+    kanban = config.get("kanban") or {}
+    if not isinstance(kanban, dict):
+        raise RuntimeError("profile kanban config must be a mapping")
+    raw = kanban.get("default_assignee") or ""
+    if not isinstance(raw, str):
+        raise RuntimeError("kanban.default_assignee must be a string")
+    return raw.strip().lstrip("@").lower()
+
+
+def _kanban_busy_count(
+    root: Path,
+    profile: str,
+    *,
+    default_assignee: str = "",
+) -> tuple[int, int]:
     primary = root / "kanban.db"
     if not primary.is_file() or primary.stat().st_size <= 0:
         raise RuntimeError(f"required kanban database is missing or empty: {primary}")
@@ -151,8 +175,18 @@ def _kanban_busy_count(root: Path, profile: str) -> tuple[int, int]:
             normalized = str(assignee or "").strip().lstrip("@").lower()
             if status == "running" and normalized == profile:
                 busy += 1
-            elif status == "ready" and normalized in {"", "unassigned", profile}:
-                busy += 1
+            elif status == "ready":
+                # Unassigned Ready work belongs only to the profile this
+                # gateway would route through kanban.default_assignee. Without
+                # a configured fallback it is not evidence that every profile
+                # is busy. Explicit assignments remain conservative.
+                routed = (
+                    default_assignee
+                    if normalized in {"", "unassigned"}
+                    else normalized
+                )
+                if routed not in {"", "unassigned"} and routed == profile:
+                    busy += 1
     return busy, checked
 
 
@@ -226,7 +260,12 @@ def probe(args: argparse.Namespace) -> dict[str, Any]:
     if args.require_telegram_connected and telegram_state != "connected":
         raise RuntimeError("Telegram platform is not connected")
 
-    kanban_busy, databases_checked = _kanban_busy_count(root, args.profile)
+    default_assignee = _profile_default_assignee(profile_home)
+    kanban_busy, databases_checked = _kanban_busy_count(
+        root,
+        args.profile,
+        default_assignee=default_assignee,
+    )
     return {
         "pid": pid,
         "start_time": start_time,

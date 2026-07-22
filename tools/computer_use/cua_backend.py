@@ -1345,6 +1345,12 @@ class CuaDriverBackend(ComputerUseBackend):
         # degrade to the anonymous / unsynced path documented in the
         # MCP server instructions.
         self._session_id: str = f"hermes-{uuid.uuid4().hex[:12]}"
+        # Logical-session revival is distinct from transport reconnection. A
+        # generation counter lets concurrent calls observe that another caller
+        # already revived the shared session instead of racing duplicate
+        # start_session calls.
+        self._logical_recovery_lock = threading.Lock()
+        self._logical_session_generation = 0
 
     # ── Lifecycle ──────────────────────────────────────────────────
     def start(self) -> None:
@@ -1412,6 +1418,124 @@ class CuaDriverBackend(ComputerUseBackend):
         self._last_target = None
         self._snapshot_tokens = {}
 
+    @staticmethod
+    def _logical_session_has_ended(out: Dict[str, Any], session_id: str) -> bool:
+        """Return whether cua-driver rejected a call for an expired run session.
+
+        A daemon restart is a transport failure and is repaired by
+        ``CuaDriverSession.call_tool``.  This is the distinct in-band failure
+        returned by the live daemon when its transport is healthy but a
+        previously declared logical session no longer exists.
+        """
+        if not isinstance(out, dict) or out.get("isError") is not True:
+            return False
+        parts: List[str] = []
+        for value in (out.get("data"), out.get("structuredContent")):
+            if isinstance(value, str):
+                parts.append(value)
+            elif isinstance(value, dict):
+                for key in ("message", "error", "detail", "data"):
+                    nested = value.get(key)
+                    if isinstance(nested, str):
+                        parts.append(nested)
+        message = " ".join(parts)
+        return bool(
+            session_id
+            and re.search(re.escape(session_id), message, re.IGNORECASE)
+            and re.search(
+                r"\bsession\b.*\bhas ended\b",
+                message,
+                re.IGNORECASE | re.DOTALL,
+            )
+        )
+
+    @staticmethod
+    def _logical_error_message(out: Dict[str, Any]) -> str:
+        """Extract a concise driver error without depending on one response shape."""
+        data = out.get("data")
+        if isinstance(data, str) and data:
+            return data
+        structured = out.get("structuredContent")
+        if isinstance(structured, dict):
+            for key in ("message", "error", "detail", "data"):
+                value = structured.get(key)
+                if isinstance(value, str) and value:
+                    return value
+        return "unknown logical session error"
+
+    def _call_driver_tool(
+        self,
+        name: str,
+        args: Dict[str, Any],
+        *,
+        timeout: Optional[float] = None,
+        replay_after_revival: bool = False,
+    ) -> Dict[str, Any]:
+        """Call cua-driver and revive an expired logical session safely.
+
+        The backend is cached for the gateway process lifetime, while the
+        daemon may retire its declared run session independently.  Preserve
+        transport recovery in ``CuaDriverSession`` and add bounded logical
+        recovery here so a dead session cannot poison every later tool call.
+
+        Read-only callers may opt into one replay after revival. Mutating calls
+        deliberately fail closed after the session is revived: replaying a
+        click/type/launch without a pre-execution guarantee could duplicate a
+        side effect or reuse a stale element token. The caller must capture
+        fresh state and issue the action again.
+        """
+        payload = dict(args)
+        payload.setdefault("session", self._session_id)
+        observed_generation = self._logical_session_generation
+
+        def call_once(tool_name: str, tool_args: Dict[str, Any]) -> Dict[str, Any]:
+            # Preserve the historical two-argument call shape on normal typed
+            # wrappers.  The generic escape hatch still forwards an explicit
+            # caller timeout when one was supplied.
+            if timeout is None:
+                return self._session.call_tool(tool_name, tool_args)
+            return self._session.call_tool(tool_name, tool_args, timeout=timeout)
+
+        out = call_once(name, payload)
+        session_id = str(payload.get("session") or self._session_id)
+        if (
+            name in {"start_session", "end_session"}
+            or not self._logical_session_has_ended(out, session_id)
+        ):
+            return out
+
+        self._clear_active_target()
+        with self._logical_recovery_lock:
+            if self._logical_session_generation == observed_generation:
+                logger.warning(
+                    "cua-driver logical session ended during %s; reviving once",
+                    name,
+                )
+                revived = call_once(
+                    "start_session",
+                    {"session": session_id},
+                )
+                if revived.get("isError") is True:
+                    raise RuntimeError(
+                        "cua-driver logical session revival failed: "
+                        + self._logical_error_message(revived)
+                    )
+                self._logical_session_generation += 1
+
+        if not replay_after_revival:
+            return {
+                "data": (
+                    f"cua-driver session {session_id!r} was revived after {name} "
+                    "was rejected; the potentially mutating call was not "
+                    "replayed. Capture fresh state and retry the action."
+                ),
+                "images": [],
+                "image_mime_types": [],
+                "structuredContent": None,
+                "isError": True,
+            }
+        return call_once(name, payload)
+
     def _failed_capture(self, mode: str, message: str = "") -> CaptureResult:
         """Return an empty capture after disarming any prior target context."""
         self._clear_active_target()
@@ -1429,7 +1553,7 @@ class CuaDriverBackend(ComputerUseBackend):
     def _call_capture_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Call a capture-stage tool and disarm state on transport or logical failure."""
         try:
-            out = self._session.call_tool(name, args)
+            out = self._call_driver_tool(name, args, replay_after_revival=True)
         except Exception:
             self._clear_active_target()
             raise
@@ -2141,7 +2265,11 @@ class CuaDriverBackend(ComputerUseBackend):
 
     # ── Introspection ──────────────────────────────────────────────
     def list_apps(self) -> List[Dict[str, Any]]:
-        out = self._session.call_tool("list_apps", {"session": self._session_id})
+        out = self._call_driver_tool(
+            "list_apps",
+            {"session": self._session_id},
+            replay_after_revival=True,
+        )
         structured = out.get("structuredContent")
         if isinstance(structured, dict) and isinstance(structured.get("apps"), list):
             return structured["apps"]
@@ -2244,7 +2372,7 @@ class CuaDriverBackend(ComputerUseBackend):
             args["additional_arguments"] = list(additional_arguments)
         if creates_new_application_instance:
             args["creates_new_application_instance"] = True
-        out = self._session.call_tool("launch_app", args)
+        out = self._call_driver_tool("launch_app", args)
         return out["structuredContent"] or {"data": out["data"]}
 
     def kill_app(self, *, pid: int) -> ActionResult:
@@ -2275,8 +2403,10 @@ class CuaDriverBackend(ComputerUseBackend):
     def get_cursor_position(self) -> Tuple[int, int]:
         """Return the *real* OS cursor position in screen points
         (origin top-left)."""
-        out = self._session.call_tool(
-            "get_cursor_position", {"session": self._session_id}
+        out = self._call_driver_tool(
+            "get_cursor_position",
+            {"session": self._session_id},
+            replay_after_revival=True,
         )
         sc = out.get("structuredContent") or {}
         return int(sc.get("x", 0)), int(sc.get("y", 0))
@@ -2285,8 +2415,10 @@ class CuaDriverBackend(ComputerUseBackend):
         """Return the logical size of the main display in points plus
         its backing scale factor. Shape:
         ``{width, height, backing_scale_factor}``."""
-        out = self._session.call_tool(
-            "get_screen_size", {"session": self._session_id}
+        out = self._call_driver_tool(
+            "get_screen_size",
+            {"session": self._session_id},
+            replay_after_revival=True,
         )
         return out.get("structuredContent") or {}
 
@@ -2296,13 +2428,17 @@ class CuaDriverBackend(ComputerUseBackend):
         """Return a JPEG / PNG of a sub-region of a window, optionally
         scaled. cua-driver supports zoom-to-rect for callers that need
         a higher-resolution view of a specific element."""
-        return self._session.call_tool("zoom", {
-            "window_id": int(window_id),
-            "x": float(x), "y": float(y), "w": float(w), "h": float(h),
-            "factor": float(factor),
-            "format": format, "quality": int(quality),
-            "session": self._session_id,
-        })
+        return self._call_driver_tool(
+            "zoom",
+            {
+                "window_id": int(window_id),
+                "x": float(x), "y": float(y), "w": float(w), "h": float(h),
+                "factor": float(factor),
+                "format": format, "quality": int(quality),
+                "session": self._session_id,
+            },
+            replay_after_revival=True,
+        )
 
     # ── Agent cursor (overlay) ──────────────────────────────────────
     #
@@ -2365,7 +2501,11 @@ class CuaDriverBackend(ComputerUseBackend):
         args: Dict[str, Any] = {"session": self._session_id}
         if cursor_id:
             args["cursor_id"] = cursor_id
-        out = self._session.call_tool("get_agent_cursor_state", args)
+        out = self._call_driver_tool(
+            "get_agent_cursor_state",
+            args,
+            replay_after_revival=True,
+        )
         return out.get("structuredContent") or {}
 
     # ── Recording / replay ──────────────────────────────────────────
@@ -2377,7 +2517,7 @@ class CuaDriverBackend(ComputerUseBackend):
         the main display to ``<output_dir>/recording.mp4`` (H.264).
         Recording ownership is keyed by this run's session id so
         concurrent runs don't fight over the recorder."""
-        out = self._session.call_tool("start_recording", {
+        out = self._call_driver_tool("start_recording", {
             "output_dir": output_dir,
             "record_video": bool(record_video),
             "session": self._session_id,
@@ -2387,7 +2527,7 @@ class CuaDriverBackend(ComputerUseBackend):
     def stop_recording(self) -> Dict[str, Any]:
         """Disable recording and finalise the mp4 (if video was on).
         Returns the recorder's final state including ``last_video_path``."""
-        out = self._session.call_tool("stop_recording", {
+        out = self._call_driver_tool("stop_recording", {
             "session": self._session_id,
         })
         return out.get("structuredContent") or {}
@@ -2396,8 +2536,10 @@ class CuaDriverBackend(ComputerUseBackend):
         """Return the current recorder state without changing it.
         Shape: ``{recording, enabled, output_dir, next_turn,
         last_video_path, last_error, owner, video_active}``."""
-        out = self._session.call_tool(
-            "get_recording_state", {"session": self._session_id}
+        out = self._call_driver_tool(
+            "get_recording_state",
+            {"session": self._session_id},
+            replay_after_revival=True,
         )
         return out.get("structuredContent") or {}
 
@@ -2407,7 +2549,7 @@ class CuaDriverBackend(ComputerUseBackend):
         """Replay a prior recording's turn stream by re-invoking each
         turn's tool call in lexical order. ``dry_run=True`` logs without
         actually firing the tools."""
-        return self._session.call_tool("replay_trajectory", {
+        return self._call_driver_tool("replay_trajectory", {
             "trajectory_dir": trajectory_dir,
             "dry_run": bool(dry_run),
             "speed_factor": float(speed_factor),
@@ -2418,7 +2560,7 @@ class CuaDriverBackend(ComputerUseBackend):
         """Bootstrap ffmpeg for ``start_recording(record_video=True)``
         on Linux / Windows. macOS records natively via ScreenCaptureKit
         and doesn't need ffmpeg."""
-        return self._session.call_tool(
+        return self._call_driver_tool(
             "install_ffmpeg", {"session": self._session_id}
         )
 
@@ -2426,8 +2568,10 @@ class CuaDriverBackend(ComputerUseBackend):
 
     def get_config(self) -> Dict[str, Any]:
         """Return the current cua-driver runtime config."""
-        out = self._session.call_tool(
-            "get_config", {"session": self._session_id}
+        out = self._call_driver_tool(
+            "get_config",
+            {"session": self._session_id},
+            replay_after_revival=True,
         )
         return out.get("structuredContent") or {}
 
@@ -2446,8 +2590,10 @@ class CuaDriverBackend(ComputerUseBackend):
         Roughly the data ``list_windows`` exposes, in one call. Most
         callers should prefer ``capture()`` / ``focus_app()`` which
         already use this shape internally."""
-        out = self._session.call_tool(
-            "get_accessibility_tree", {"session": self._session_id}
+        out = self._call_driver_tool(
+            "get_accessibility_tree",
+            {"session": self._session_id},
+            replay_after_revival=True,
         )
         return out.get("structuredContent") or {"data": out["data"]}
 
@@ -2467,7 +2613,7 @@ class CuaDriverBackend(ComputerUseBackend):
             "session": self._session_id,
         }
         args.update(page_args)
-        return self._session.call_tool("page", args)
+        return self._call_driver_tool("page", args)
 
     # ── Generic escape hatch ────────────────────────────────────────
 
@@ -2481,7 +2627,7 @@ class CuaDriverBackend(ComputerUseBackend):
         keeps the session-id contract consistent with everything else."""
         payload = dict(args) if args else {}
         payload.setdefault("session", self._session_id)
-        return self._session.call_tool(name, payload, timeout=timeout)
+        return self._call_driver_tool(name, payload, timeout=timeout)
 
     # ── Internal ───────────────────────────────────────────────────
     def _maybe_attach_element_token(self, tool: str, args: Dict[str, Any]) -> None:
@@ -2520,7 +2666,7 @@ class CuaDriverBackend(ComputerUseBackend):
         # session a caller already supplied.
         args.setdefault("session", self._session_id)
         try:
-            out = self._session.call_tool(name, args)
+            out = self._call_driver_tool(name, args)
         except Exception as e:
             logger.exception("cua-driver %s call failed", name)
             return ActionResult(ok=False, action=name, message=f"cua-driver error: {e}")

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sqlite3
 import subprocess
 import sys
 
@@ -63,6 +64,66 @@ def test_runtime_executable_accepts_launcher_and_copied_venv_layouts(
         expected,
         unrelated / "pythonw.exe",
     )
+
+
+def _write_minimal_kanban(root: Path, rows: list[tuple[str, str | None]]) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(root / "kanban.db") as connection:
+        connection.execute("CREATE TABLE tasks (status TEXT, assignee TEXT)")
+        connection.executemany(
+            "INSERT INTO tasks(status, assignee) VALUES (?, ?)",
+            rows,
+        )
+
+
+def test_unassigned_ready_card_does_not_mark_every_profile_busy(tmp_path):
+    root = tmp_path / "hermes"
+    _write_minimal_kanban(root, [("ready", None), ("ready", "unassigned")])
+
+    assert guard_module._kanban_busy_count(root, "rikku") == (0, 1)
+    assert guard_module._kanban_busy_count(root, "asuna") == (0, 1)
+    assert guard_module._kanban_busy_count(
+        root, "rikku", default_assignee="rikku",
+    ) == (2, 1)
+
+
+def test_assigned_ready_and_running_cards_remain_profile_scoped_busy(tmp_path):
+    root = tmp_path / "hermes"
+    _write_minimal_kanban(
+        root,
+        [
+            ("ready", "@Rikku"),
+            ("running", "rikku"),
+            ("ready", "asuna"),
+            ("running", "kurumi"),
+            ("done", "rikku"),
+        ],
+    )
+
+    assert guard_module._kanban_busy_count(root, "rikku") == (2, 1)
+    assert guard_module._kanban_busy_count(root, "asuna") == (1, 1)
+    assert guard_module._kanban_busy_count(root, "yuna") == (0, 1)
+
+
+def test_named_board_assigned_ready_card_is_included(tmp_path):
+    root = tmp_path / "hermes"
+    _write_minimal_kanban(root, [])
+    board = root / "kanban" / "boards" / "named"
+    _write_minimal_kanban(board, [("ready", "rikku")])
+    (board / "board.json").write_text("{}", encoding="utf-8")
+
+    assert guard_module._kanban_busy_count(root, "rikku") == (1, 2)
+
+
+def test_profile_default_assignee_is_normalized(tmp_path):
+    home = tmp_path / "profiles" / "rikku"
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        "kanban:\n  default_assignee: ' @Rikku '\n",
+        encoding="utf-8",
+    )
+
+    assert guard_module._profile_default_assignee(home) == "rikku"
 
 
 def test_drain_begin_binds_lease_to_explicit_live_owner(tmp_path):
